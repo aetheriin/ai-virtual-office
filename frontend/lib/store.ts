@@ -7,7 +7,7 @@ import type {
   AgentMessage, AgentStates, Busy, Candle, ItResult, NewsSentiment, Project, RunDetail, RunSummary, Task, TradingPlan,
 } from "./types";
 
-const BUBBLE_MS = 9000;
+export const BUBBLE_MS = 9000;
 
 interface OfficeState {
   connected: boolean;

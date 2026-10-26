@@ -13,8 +13,6 @@ export interface AgentDef {
   rotation: number;
   color: string;
   label: "cyan" | "green" | "orange" | "red";
-  /** Optional Ready Player Me / Mixamo .glb in /public/avatars — falls back to the voxel avatar */
-  glb?: string;
 }
 
 // Left room: Departemen IT (x < 0). Right room: Departemen Investasi (x > 0).

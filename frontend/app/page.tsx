@@ -6,6 +6,7 @@ import { ItPanel } from "@/components/panels/ItPanel";
 import { LogFeed } from "@/components/panels/LogFeed";
 import { TradePanel } from "@/components/panels/TradePanel";
 import type { Dept } from "@/lib/agents";
+import { loadAvatarManifest } from "@/lib/avatars";
 import { connectOffice, useOffice } from "@/lib/store";
 
 const OfficeScene = dynamic(() => import("@/components/office/OfficeScene"), {
@@ -32,7 +33,7 @@ export default function Home() {
   const [tab, setTab] = useState<Dept>("trade");
   const [panelOpen, setPanelOpen] = useState(true);
 
-  useEffect(() => { connectOffice(); }, []);
+  useEffect(() => { connectOffice(); void loadAvatarManifest(); }, []);
   useEffect(() => { if (focus) setTab(focus); }, [focus]);
 
   return (

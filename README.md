@@ -67,7 +67,7 @@ npm run dev                         # http://localhost:3000
 cd backend && pytest -q             # 53 tes: risk math, debat, sentimen berita, pipeline IT, database (offline)
 # tes database juga terhadap PostgreSQL sungguhan (skema di DB ini akan di-reset):
 TEST_DATABASE_URL=postgresql://office:office@localhost:5432/office_test pytest -q tests/test_projects.py
-cd frontend && npm run typecheck && npm run build
+cd frontend && npm test && npm run typecheck && npm run build   # npm test: logika avatar .glb (Node 22+)
 ```
 
 ## Database proyek IT (PostgreSQL)
@@ -151,13 +151,48 @@ Semua model bisa diganti lewat `.env`. ID model gratis di OpenRouter sering beru
 
 Event Socket.IO: `agent:status`, `agent:message`, `it:tasks`, `it:task_status`, `it:result`, `trade:market`, `trade:news`, `trade:plan`, `job:start|end|error`.
 
-## Avatar Ready Player Me / Mixamo
+## Avatar 3D (.glb)
 
-Avatar default berupa voxel prosedural (banteng, beruang, orb hakim, dan staf IT) dengan animasi mengetik, berpikir, berdiri, dan berdebat. Untuk memakai `.glb` dari Ready Player Me, taruh file di `frontend/public/avatars/` lalu isi `glb: "/avatars/pm.glb"` pada agen terkait di `frontend/lib/agents.ts`.
+Secara default setiap agen memakai avatar voxel prosedural (banteng, beruang, orb hakim, staf IT). Agen mana pun bisa diganti dengan model **.glb** tanpa build ulang: taruh file di `frontend/public/avatars/`, lalu daftarkan di `frontend/public/avatars/manifest.json`.
+
+```json
+{
+  "defaults": { "animations": ["/avatars/mixamo-pack.glb"] },
+  "agents": {
+    "pm":   { "url": "/avatars/pm.glb", "height": 1.8 },
+    "qa":   { "url": "/avatars/qa.glb", "offset": [0, -0.3, 0.25] },
+    "bull": { "url": "/avatars/bull.glb", "height": 2.4, "clips": { "debating": "Arguing" } }
+  }
+}
+```
+
+| Field | Arti |
+|---|---|
+| `url` | file .glb avatar (wajib) |
+| `height` | tinggi target dalam meter; model diskalakan dan diletakkan otomatis di lantai (default 1.85) |
+| `animations` | file klip tambahan, misalnya ekspor Mixamo; digabung dengan klip bawaan model |
+| `clips` | paksa klip per state: `idle`, `sitting`, `typing`, `thinking`, `standing`, `debating` |
+| `offset`, `rotationY` | koreksi posisi dan arah hadap (mis. agen yang duduk di kursi) |
+| `rootMotion` | pertahankan track posisi Hips dari klip eksternal (default mati karena Mixamo menyimpannya dalam cm) |
+
+Cara kerjanya:
+- **Animasi per state.** Klip dipilih otomatis dari namanya, misalnya *Typing* untuk agen yang mengetik, *Thinking* saat berpikir, *Talking* saat berdiri atau berdebat, dan *Sitting* untuk agen duduk yang sedang idle. Pergantian klip memakai cross-fade.
+- **Retarget Mixamo.** Prefix tulang `mixamorig` dibuang sehingga klip Mixamo cocok dengan rig bernama standar (`Hips`, `Spine`, `LeftArm`, …).
+- **Lip-sync berbasis teks.** Mulut bergerak mengikuti huruf di *chat bubble* lewat morph `mouthOpen`/`jawOpen` atau viseme Oculus (`viseme_aa`, `viseme_O`, …), plus kedipan otomatis lewat `eyeBlinkLeft/Right`. Rhubarb belum dipakai karena butuh audio, dan aplikasi ini belum punya TTS.
+- **Aman dari file rusak.** File yang tidak ada dilewati dengan peringatan di console. File rusak otomatis kembali ke avatar voxel.
+- **Log diagnosis.** Console browser menampilkan baris `[avatar] pm: … · 5 clip (…) · lip-sync: mouthOpen` untuk tiap avatar yang dimuat.
+
+**Contoh siap pakai:** salin `manifest.example.json` menjadi `manifest.json` untuk mencoba `sample-bot.glb` dan `sample-anims.glb`. Kedua file ini dibuat oleh `npm run avatars:sample` (skrip Python, tanpa download, bebas lisensi) dan meniru susunan avatar ber-rig Mixamo + klip Mixamo terpisah.
+
+**Sumber avatar:**
+- **Ready Player Me sudah menutup layanan publiknya pada 31 Januari 2026.** File .glb RPM yang sudah Anda unduh tetap bisa dipakai, tapi avatar baru tidak bisa dibuat lagi di sana.
+- **Alternatif:** generator yang mengekspor .glb dengan tulang bernama Mixamo, misalnya Avaturn atau MetaPerson, seharusnya langsung cocok. Ini belum saya uji dengan file asli dari layanan tersebut.
+- **Animasi:** unduh dari Mixamo (FBX), konversi ke .glb (misalnya lewat Blender), lalu daftarkan di `animations`.
+- **VRM / VRoid:** nama tulangnya berbeda dan belum didukung retarget otomatis.
 
 ## Roadmap
 
-- Lip sync (Rhubarb) dan klip Mixamo untuk avatar `.glb`.
+- Suara (TTS) + lip-sync Rhubarb berbasis audio; retarget rig VRM/VRoid.
 - Akun pengguna & login (tabel `users` di PostgreSQL).
 - Agen IT menulis langsung ke repo (PR otomatis).
 

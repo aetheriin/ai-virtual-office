@@ -1,0 +1,10 @@
+{
+  "defaults": {
+    "animations": ["/avatars/sample-anims.glb"]
+  },
+  "agents": {
+    "pm": { "url": "/avatars/sample-bot.glb", "height": 1.85 },
+    "qa": { "url": "/avatars/sample-bot.glb", "height": 1.7, "offset": [0, -0.3, 0.25], "clips": { "thinking": "Thinking" } },
+    "bull": { "url": "/avatars/sample-bot.glb", "height": 2.3, "clips": { "debating": "Talking" } }
+  }
+}

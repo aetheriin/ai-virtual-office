@@ -1,12 +1,13 @@
 "use client";
 
-import { Html, useGLTF } from "@react-three/drei";
+import { Html } from "@react-three/drei";
 import { useFrame } from "@react-three/fiber";
 import { Suspense, useEffect, useMemo, useReducer, useRef } from "react";
 import * as THREE from "three";
-import { clone as cloneSkinned } from "three/examples/jsm/utils/SkeletonUtils.js";
 import type { AgentDef, AgentState } from "@/lib/agents";
+import { avatarFor, useAvatars } from "@/lib/avatars";
 import { useOffice } from "@/lib/store";
+import { AvatarBoundary, GlbAvatar } from "./GlbAvatar";
 import { Box } from "./props";
 
 const SKIN = "#f1c7a0";
@@ -203,17 +204,13 @@ function RiskOrb({ def, state }: { def: AgentDef; state: AgentState }) {
   );
 }
 
-function GlbAvatar({ url }: { url: string }) {
-  const { scene } = useGLTF(url);
-  const cloned = useMemo(() => cloneSkinned(scene), [scene]);
-  return <primitive object={cloned} />;
-}
-
 const SEATED = new Set(["analyst", "qa", "fe", "be", "db"]);
 
 export function AgentAvatar({ def }: { def: AgentDef }) {
   const state = useOffice((s) => s.states[def.id]);
   const bubble = useOffice((s) => s.bubbles[def.id]);
+  const manifest = useAvatars((s) => s.manifest);
+  const glb = useMemo(() => avatarFor(manifest, def.id), [manifest, def.id]);
   const ring = useRef<THREE.Mesh>(null);
   const [, rerender] = useReducer((x: number) => x + 1, 0);
   useEffect(() => {
@@ -232,13 +229,16 @@ export function AgentAvatar({ def }: { def: AgentDef }) {
     ring.current.scale.setScalar(active ? 1 + Math.sin(clock.elapsedTime * 5) * 0.06 : 1);
   });
 
+  const seated = SEATED.has(def.id);
   const voxel =
     def.kind === "bull" ? <Bull def={def} state={state} /> :
     def.kind === "bear" ? <Bear def={def} state={state} /> :
     def.kind === "orb" ? <RiskOrb def={def} state={state} /> :
-    <Human def={def} state={state} seated={SEATED.has(def.id)} />;
+    <Human def={def} state={state} seated={seated} />;
 
-  const headY = def.kind === "human" ? 2.3 : def.kind === "orb" ? 1.9 : 2.75;
+  const headY = glb
+    ? (glb.height ?? 1.85) + (glb.offset?.[1] ?? 0) + 0.45
+    : def.kind === "human" ? 2.3 : def.kind === "orb" ? 1.9 : 2.75;
 
   return (
     <group position={def.position}>
@@ -247,7 +247,13 @@ export function AgentAvatar({ def }: { def: AgentDef }) {
         <meshBasicMaterial color={labelColor} transparent opacity={0} toneMapped={false} />
       </mesh>
       <group rotation={[0, def.rotation, 0]}>
-        {def.glb ? <Suspense fallback={voxel}><GlbAvatar url={def.glb} /></Suspense> : voxel}
+        {glb ? (
+          <AvatarBoundary url={glb.url} fallback={voxel}>
+            <Suspense fallback={voxel}>
+              <GlbAvatar id={def.id} config={glb} state={state} seated={seated} />
+            </Suspense>
+          </AvatarBoundary>
+        ) : voxel}
       </group>
 
       <Html position={[0, headY, 0]} center zIndexRange={[16, 1]} pointerEvents="none">
