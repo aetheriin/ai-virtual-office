@@ -41,7 +41,7 @@ docker compose up -d            # PostgreSQL 16 di localhost:5432 (user/pass/db:
 
 Tanpa Docker: pakai PostgreSQL yang sudah ada dan isi `DATABASE_URL`. Kalau `DATABASE_URL` dikosongkan, backend otomatis memakai file SQLite `backend/projects.db`, jadi aplikasi tetap jalan tanpa server database.
 
-### 2. Backend (Python 3.11+)
+### 2. Backend (Python 3.10+)
 
 ```bash
 cd backend
