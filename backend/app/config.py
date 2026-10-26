@@ -33,6 +33,16 @@ class Settings:
     model_debate: str = os.getenv("MODEL_DEBATE", "meta-llama/llama-3.1-8b-instruct:free")
 
     twelve_data_api_key: str = os.getenv("TWELVE_DATA_API_KEY", "")
+    alpha_vantage_api_key: str = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+    finnhub_api_key: str = os.getenv("FINNHUB_API_KEY", "")
+    news_rss_feeds: list[str] = field(
+        default_factory=lambda: [u.strip() for u in os.getenv(
+            "NEWS_RSS_FEEDS", "https://www.fxstreet.com/rss/news,https://www.investing.com/rss/news_1.rss"
+        ).split(",") if u.strip()]
+    )
+    news_lookback_hours: float = _float("NEWS_LOOKBACK_HOURS", 24)
+    news_use_llm: bool = _bool("NEWS_USE_LLM", True)
+    enable_news: bool = _bool("ENABLE_NEWS", True)
     allow_synthetic_data: bool = _bool("ALLOW_SYNTHETIC_DATA", True)
 
     default_capital: float = _float("DEFAULT_CAPITAL", 10_000_000)

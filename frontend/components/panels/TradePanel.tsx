@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useOffice } from "@/lib/store";
+import { NewsCard } from "./NewsCard";
 import { PlanCard } from "./PlanCard";
 
 const QUICK = ["BBCA", "BBRI", "TLKM", "XAUUSD", "EURUSD", "USDJPY"];
@@ -12,6 +13,7 @@ export function TradePanel() {
   const busy = useOffice((s) => s.busy.trade);
   const connected = useOffice((s) => s.connected);
   const plan = useOffice((s) => s.plan);
+  const news = useOffice((s) => s.news);
   const [symbol, setSymbol] = useState("BBCA");
   const [interval, setInterval] = useState("15m");
   const [capital, setCapital] = useState("10000000");
@@ -72,6 +74,7 @@ export function TradePanel() {
         </button>
       </form>
 
+      {!plan && news && <NewsCard news={news} />}
       {plan ? <PlanCard plan={plan} /> : (
         <div className="panel font-term p-4 text-center text-lg text-white/50">
           {busy ? "Risk Agent menunggu argumen Bull & Bear..." : "Pilih simbol untuk memunculkan kartu Trading Plan."}

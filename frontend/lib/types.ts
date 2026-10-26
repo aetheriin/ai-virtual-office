@@ -43,6 +43,27 @@ export interface Proposal {
   rr_tp2: number;
 }
 
+export interface NewsHeadline {
+  title: string;
+  source: string;
+  url: string;
+  published: string;
+  score: number;
+  method: "alphavantage" | "llm" | "lexicon";
+  high_impact: boolean;
+}
+
+export interface NewsSentiment {
+  symbol: string;
+  score: number;
+  label: "bullish" | "bearish" | "neutral" | "no_data";
+  count: number;
+  sources: string[];
+  event_risk: boolean;
+  strong: boolean;
+  headlines: NewsHeadline[];
+}
+
 export interface TradingPlan {
   session_id: string;
   symbol: string;
@@ -70,6 +91,7 @@ export interface TradingPlan {
   demo: boolean;
   bull: Proposal;
   bear: Proposal;
+  news: NewsSentiment | null;
 }
 
 export interface ItResult {

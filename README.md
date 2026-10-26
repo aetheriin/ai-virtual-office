@@ -16,6 +16,7 @@ Next.js + Tailwind + React Three Fiber  ◀── Socket.IO ──▶  FastAPI +
                                                               ├─ agents/trading.py        (Bull/Bear/Risk)
                                                               ├─ market/data.py           (MT5 → yfinance → Twelve Data → sintetis)
                                                               ├─ market/indicators.py     (struktur, S/R, ATR, volume, wick)
+                                                              ├─ market/news.py           (sentimen berita: Alpha Vantage, Finnhub, RSS, yfinance)
                                                               ├─ risk.py                  (RR, ukuran posisi, tick IDX)
                                                               ├─ llm.py                   (OpenRouter + Google AI Studio)
                                                               └─ db.py                    (SQLite: log debat & plan)
@@ -24,7 +25,7 @@ Next.js + Tailwind + React Three Fiber  ◀── Socket.IO ──▶  FastAPI +
 ### Prinsip penting
 
 - **Angka tidak pernah dari LLM.** Entry, SL, TP, RR, dan ukuran posisi dihitung deterministik dari data candle. LLM hanya menulis argumen, dan Risk Agent (LLM) hanya boleh *menurunkan* keputusan menjadi WAIT, tidak boleh membuka posisi baru.
-- **Hak veto Risk Agent** (aturan keras): batas rugi harian, volatilitas ekstrem (ATR%), selisih bukti Bull/Bear < 2 poin, RR TP2 < `MIN_RR` (default 1:1.5), TP1 < 1R, atau modal tidak cukup untuk 1 lot.
+- **Hak veto Risk Agent** (aturan keras): batas rugi harian, volatilitas ekstrem (ATR%), selisih bukti Bull/Bear < 2 poin, RR TP2 < `MIN_RR` (default 1:1.5), TP1 < 1R, sentimen berita kuat yang berlawanan, atau modal tidak cukup untuk 1 lot.
 - **Jalan tanpa API key.** Tanpa key, semua agen memakai *rule engine* (badge `RULE ENGINE`). Jika sumber data live tidak terjangkau, data sintetis dipakai dan kartu diberi label **DATA SINTETIS — JANGAN dieksekusi**.
 - Rahasia hanya di `.env` (lihat `.env.example`).
 
@@ -54,9 +55,29 @@ npm run dev                         # http://localhost:3000
 ### 3. Tes
 
 ```bash
-cd backend && pytest -q             # 19 tes: risk math, debat, pipeline IT (offline)
+cd backend && pytest -q             # 42 tes: risk math, debat, sentimen berita, pipeline IT (offline)
 cd frontend && npm run typecheck && npm run build
 ```
+
+## Sentimen berita
+
+Setiap analisa menarik berita dari sumber yang tersedia (digabung, duplikat dibuang, maks. `NEWS_LOOKBACK_HOURS` jam):
+
+| Sumber | Key | Cakupan |
+|---|---|---|
+| Alpha Vantage `NEWS_SENTIMENT` | `ALPHA_VANTAGE_API_KEY` | forex, memakai skor sentimen per mata uang dari Alpha Vantage |
+| Finnhub forex news | `FINNHUB_API_KEY` | forex |
+| RSS (default FXStreet & Investing.com) | tanpa key | forex, emas |
+| yfinance `Ticker.news` | tanpa key | saham IDX |
+
+**Cara menilai:**
+- **Arah per pair.** Untuk pair BASE/QUOTE, skor berita = sentimen(BASE) − sentimen(QUOTE). Contohnya, "Fed dovish" dihitung bearish untuk USD, jadi bullish untuk XAUUSD/EURUSD dan bearish untuk USDJPY. Judul yang menyebut dua mata uang dinilai per klausa ("Gold slumps *as* dollar strength returns" → bearish emas).
+- **Skor per judul.** Urutan prioritas: skor Alpha Vantage, lalu LLM (`MODEL_DEBATE`, bila `NEWS_USE_LLM=true`), lalu leksikon kata kunci. Agregatnya rata-rata berbobot waktu (half-life 6 jam), dalam rentang −1…+1.
+- **Pengaruh ke debat:**
+  - Sentimen ≥ ±0.15 dari minimal 2 berita menambah **maks. 1.5 poin** bukti ke Bull atau Bear. Bobot ini sengaja lebih kecil daripada struktur harga (2 poin).
+  - Risk Agent **memveto** trade jika sentimen kuat (≥ ±0.4, minimal 3 berita) berlawanan arah.
+  - Rilis berdampak tinggi (NFP/CPI/FOMC/keputusan bank sentral) dalam 3 jam terakhir menjadi risiko Bear sekaligus peringatan di plan.
+- **Tampilan.** Panel menampilkan gauge sentimen dan daftar judul (skor, sumber, umur, metode AV/AI/KW). Di ruang trading 3D ada *ticker* berita berjalan.
 
 ## Model per peran
 
@@ -86,8 +107,9 @@ Semua model bisa diganti lewat `.env`. ID model gratis di OpenRouter sering beru
 | POST | `/api/it/request` | `{prompt}` |
 | GET | `/api/sessions`, `/api/sessions/{id}` | riwayat & log debat (SQLite) |
 | GET | `/api/plans?symbol=BBCA` | riwayat trading plan |
+| GET | `/api/news/{symbol}` | sentimen berita saja (tanpa debat) |
 
-Event Socket.IO: `agent:status`, `agent:message`, `it:tasks`, `it:task_status`, `it:result`, `trade:market`, `trade:plan`, `job:start|end|error`.
+Event Socket.IO: `agent:status`, `agent:message`, `it:tasks`, `it:task_status`, `it:result`, `trade:market`, `trade:news`, `trade:plan`, `job:start|end|error`.
 
 ## Avatar Ready Player Me / Mixamo
 
@@ -96,7 +118,6 @@ Avatar default berupa voxel prosedural (banteng, beruang, orb hakim, dan staf IT
 ## Roadmap
 
 - Lip sync (Rhubarb) dan klip Mixamo untuk avatar `.glb`.
-- Sentimen berita forex (Forex News API) sebagai bukti tambahan Bull/Bear.
 - PostgreSQL untuk data pengguna/proyek IT; agen IT menulis langsung ke repo (PR otomatis).
 
 > ⚠️ Bukan saran keuangan. Trading Plan adalah alat bantu analisa; selalu verifikasi sendiri sebelum eksekusi di MetaTrader/sekuritas.

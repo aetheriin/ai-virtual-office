@@ -208,6 +208,35 @@ function MarketScreen() {
   );
 }
 
+/** Scrolling headline ticker along the trading-room back wall. */
+function NewsTicker() {
+  const news = useOffice((s) => s.news ?? s.plan?.news ?? null);
+  const items = news?.headlines.slice(0, 8) ?? [];
+  const color = news?.label === "bullish" ? PALETTE.green : news?.label === "bearish" ? PALETTE.red : PALETTE.orange;
+  return (
+    <Screen position={[6.5, 0.55, -5.85]} w={8.4} h={0.42} glow={color}>
+      <Html transform distanceFactor={4.2} pointerEvents="none" zIndexRange={[5, 0]}>
+        <div className="font-term w-[780px] overflow-hidden whitespace-nowrap text-[22px]" style={{ color }}>
+          <div className="ticker inline-block">
+            {items.length === 0 ? (
+              <span>NEWS · menunggu analisa · sentimen berita forex & saham · </span>
+            ) : (
+              [...items, ...items].map((h, i) => (
+                <span key={i} className="mr-10">
+                  <span style={{ color: h.score > 0.05 ? PALETTE.green : h.score < -0.05 ? PALETTE.red : "#9aa6c2" }}>
+                    {h.score > 0.05 ? "▲" : h.score < -0.05 ? "▼" : "■"}
+                  </span>{" "}
+                  {h.title}
+                </span>
+              ))
+            )}
+          </div>
+        </div>
+      </Html>
+    </Screen>
+  );
+}
+
 function Office() {
   const itBusy = useOffice((s) => s.busy.it);
   return (
@@ -271,6 +300,7 @@ function Office() {
         <ChartLine w={1.8} h={1.2} trend={0.2} color={PALETTE.orange} seed={23} />
       </Screen>
       <TradingTable />
+      <NewsTicker />
       <Plant position={[10.2, 0, -5.2]} />
       <WallSign position={[6.2, 0.03, 4.6]} flat text="Departemen Investasi" color={PALETTE.green} size={22} />
 

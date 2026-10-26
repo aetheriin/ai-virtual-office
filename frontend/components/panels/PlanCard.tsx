@@ -1,6 +1,7 @@
 import type { TradingPlan } from "@/lib/types";
 import { useOffice } from "@/lib/store";
 import { MiniChart } from "./MiniChart";
+import { NewsCard } from "./NewsCard";
 
 const STATUS_STYLE = {
   BUY: { color: "#4dff7c", shadow: "shadow-neon", label: "BUY / LONG" },
@@ -96,6 +97,12 @@ export function PlanCard({ plan }: { plan: TradingPlan }) {
         </ul>
         <p className="text-white/60"><span className="text-neon-cyan">Trigger:</span> {plan.trigger}</p>
       </div>
+
+      {plan.news && (
+        <div className="mt-3 border-t border-white/10 pt-2">
+          <NewsCard news={plan.news} compact />
+        </div>
+      )}
 
       <details className="font-term mt-2 text-[16px] leading-5">
         <summary className="cursor-pointer text-white/70">Argumen Bull & Bear</summary>

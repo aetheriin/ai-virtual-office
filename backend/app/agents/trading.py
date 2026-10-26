@@ -5,7 +5,8 @@ Pipeline:
     Bull  : evidence score + LONG proposal  (+ LLM narrative)
     Bear  : evidence score + SHORT proposal + 3 biggest risks (+ LLM rebuttal)
     Bull  : short rebuttal round
-    Risk  : hard rules (volatility, RR, evidence gap, daily loss) + optional LLM veto -> Trading Plan
+    News  : headline sentiment adds evidence to the side it favours (max 1.5 points)
+    Risk  : hard rules (volatility, RR, evidence gap, daily loss, opposing news) + optional LLM veto -> Trading Plan
 
 The LLM only writes arguments and may downgrade a trade to WAIT; it never invents prices.
 """
@@ -19,12 +20,14 @@ from ..config import settings
 from ..llm import chat, extract_json
 from ..market.data import MarketData
 from ..market.indicators import MarketFacts, compute_facts
+from ..market.news import NewsSentiment
 from ..risk import position_size, round_price, rr
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
 MAX_INTRADAY_ATR_PCT = 3.5   # above this the market is too wild for an intraday plan
 MIN_EVIDENCE_GAP = 2.0       # winning side must out-score the other by this much
+MAX_NEWS_WEIGHT = 1.5        # news can never outweigh price structure (worth 2)
 
 
 def fmt(x: float) -> str:
@@ -64,6 +67,17 @@ class Proposal:
 
 
 # --------------------------------------------------------------------------- rule engines
+def _news_evidence(news: NewsSentiment | None, side: int) -> tuple[float, str] | None:
+    """Evidence tuple when headline sentiment favours `side` (+1 bull, -1 bear)."""
+    if not news or not news.usable or news.score * side <= 0:
+        return None
+    weight = round(min(MAX_NEWS_WEIGHT, 0.5 + abs(news.score) * 1.5), 1)
+    top = news.top(1, side)
+    lead = f": \"{top[0].title[:90]}\"" if top else ""
+    label = "bullish" if side > 0 else "bearish"
+    return weight, f"Sentimen berita {label} ({news.score:+.2f}, {news.count} berita){lead}"
+
+
 def _beyond(entry: float, tp1: float, tp2: float, risk: float, asset: str, *, up: bool) -> tuple[float, float]:
     """Guarantee targets remain on the profitable side of entry after tick rounding."""
     sign = 1 if up else -1
@@ -75,7 +89,7 @@ def _beyond(entry: float, tp1: float, tp2: float, risk: float, asset: str, *, up
     return tp1, tp2
 
 
-def bull_case(f: MarketFacts, asset: str) -> Proposal:
+def bull_case(f: MarketFacts, asset: str, news: NewsSentiment | None = None) -> Proposal:
     ev: list[tuple[float, str]] = []
     if f.structure == "bullish":
         ev.append((2, "Struktur bullish: Higher High & Higher Low"))
@@ -96,6 +110,8 @@ def bull_case(f: MarketFacts, asset: str) -> Proposal:
         ev.append((1, "Harga > EMA20 > EMA50"))
     if f.lower_wick_rejection:
         ev.append((1, "Ekor bawah panjang: buyer menolak harga rendah"))
+    if item := _news_evidence(news, +1):
+        ev.append(item)
 
     entry = f.last_close
     stop = min(f.support, f.swing_lows[-1]) - 0.2 * f.atr
@@ -122,7 +138,7 @@ def bull_case(f: MarketFacts, asset: str) -> Proposal:
     )
 
 
-def bear_case(f: MarketFacts, asset: str, bull: Proposal) -> Proposal:
+def bear_case(f: MarketFacts, asset: str, bull: Proposal, news: NewsSentiment | None = None) -> Proposal:
     ev: list[tuple[float, str]] = []
     if f.structure == "bearish":
         ev.append((2, "Struktur bearish: Lower High & Lower Low"))
@@ -143,8 +159,14 @@ def bear_case(f: MarketFacts, asset: str, bull: Proposal) -> Proposal:
         ev.append((1, "Volume besar saat harga turun (distribusi)"))
     if f.last_close < f.ema20 < f.ema50:
         ev.append((1, "Harga < EMA20 < EMA50"))
+    if item := _news_evidence(news, -1):
+        ev.append(item)
 
     risks: list[str] = []
+    if news and news.event_risk:
+        risks.append("Rilis data berdampak tinggi (NFP/CPI/FOMC/bank sentral) dalam 3 jam terakhir: spread & whipsaw")
+    if news and news.usable and news.score < 0:
+        risks.append(f"Sentimen berita melawan LONG ({news.score:+.2f} dari {news.count} berita)")
     if bull.rr_tp1 < settings.min_rr:
         risks.append(f"Resistance terdekat terlalu dekat: RR LONG ke TP1 hanya 1:{bull.rr_tp1:.2f}")
     if f.volume_trend != "rising":
@@ -195,6 +217,7 @@ def judge(
     asset: str,
     quote_ccy: str,
     account_ccy: str,
+    news: NewsSentiment | None = None,
 ) -> dict:
     """Risk Agent's hard rules. Returns the trading plan dict."""
     reasons: list[str] = []
@@ -214,10 +237,14 @@ def judge(
             reasons.append(f"VETO: RR {cand.side} ke TP2 hanya 1:{cand.rr_tp2:.2f} (< 1:{settings.min_rr})")
         elif cand.rr_tp1 < 1.0:
             reasons.append(f"VETO: TP1 {cand.side} terlalu dekat (RR 1:{cand.rr_tp1:.2f})")
+        elif news and news.strong and news.score * (1 if cand.side == "LONG" else -1) < 0:
+            reasons.append(f"VETO: sentimen berita kuat melawan {cand.side} ({news.score:+.2f}, {news.count} berita)")
         else:
             chosen = cand
             status = "BUY" if cand.side == "LONG" else "SELL"
             reasons.append(f"{cand.side} unggul {abs(gap):g} poin bukti; RR TP1 1:{cand.rr_tp1:.2f}, TP2 1:{cand.rr_tp2:.2f}")
+    if news and news.event_risk:
+        reasons.append("Peringatan: ada rilis data berdampak tinggi baru-baru ini; pertimbangkan ukuran posisi lebih kecil")
 
     ref = chosen or (bull if gap >= 0 else bear)
     size = position_size(
@@ -248,7 +275,7 @@ def judge(
 # --------------------------------------------------------------------------- LLM prompts
 BULL_SYSTEM = (
     "Kamu adalah BULL AGENT di Intraday Arena. Bangun kasus TERKUAT bahwa harga akan NAIK, "
-    "HANYA berdasarkan data JSON yang diberikan (harga, volume, struktur, level). Jangan mengarang angka. "
+    "HANYA berdasarkan data JSON yang diberikan (harga, volume, struktur, level, sentimen berita). Jangan mengarang angka. "
     "Jawab dalam Bahasa Indonesia, maksimal 2 kalimat tesis, tegas dan percaya diri."
 )
 BEAR_SYSTEM = (
@@ -262,11 +289,14 @@ RISK_SYSTEM = (
 )
 
 
-def _facts_brief(md: MarketData, f: MarketFacts) -> str:
-    return json.dumps(
-        {"symbol": md.instrument.symbol, "interval": md.interval, "data_source": md.source, **f.to_dict()},
-        ensure_ascii=False,
-    )
+def _facts_brief(md: MarketData, f: MarketFacts, news: NewsSentiment | None = None) -> str:
+    data = {"symbol": md.instrument.symbol, "interval": md.interval, "data_source": md.source, **f.to_dict()}
+    if news and news.count:
+        data["news_sentiment"] = {
+            "score": round(news.score, 2), "label": news.label, "count": news.count, "event_risk": news.event_risk,
+            "headlines": [{"title": h.title, "score": round(h.score, 2), "age_h": round(h.age_hours, 1)} for h in news.top(6)],
+        }
+    return json.dumps(data, ensure_ascii=False)
 
 
 def _fallback_bull_thesis(p: Proposal, f: MarketFacts) -> str:
@@ -290,15 +320,16 @@ async def run_debate(
     risk_pct: float | None = None,
     today_loss_pct: float = 0.0,
     account_currency: str = "IDR",
+    news: NewsSentiment | None = None,
 ) -> dict:
     capital = capital or settings.default_capital
     risk_pct = risk_pct or settings.default_risk_pct
     inst = md.instrument
     f = compute_facts(md.candles)
-    brief = _facts_brief(md, f)
+    brief = _facts_brief(md, f, news)
 
     await emit("agent:status", {"agent": "bull", "state": "debating"})
-    bull = bull_case(f, inst.asset_class)
+    bull = bull_case(f, inst.asset_class, news)
     bull.thesis = await chat(
         settings.model_debate, BULL_SYSTEM,
         f"DATA:\n{brief}\n\nBUKTI TERHITUNG:\n{json.dumps(bull.evidence, ensure_ascii=False)}\n"
@@ -308,7 +339,7 @@ async def run_debate(
     await emit("agent:message", {"agent": "bull", "kind": "thesis", "text": bull.thesis, "data": bull.to_dict()})
 
     await emit("agent:status", {"agent": "bear", "state": "debating"})
-    bear = bear_case(f, inst.asset_class, bull)
+    bear = bear_case(f, inst.asset_class, bull, news)
     bear.thesis = await chat(
         settings.model_debate, BEAR_SYSTEM,
         f"DATA:\n{brief}\n\nARGUMEN BULL:\n{bull.thesis}\n\nBUKTI BEARISH:\n{json.dumps(bear.evidence, ensure_ascii=False)}\n"
@@ -330,7 +361,7 @@ async def run_debate(
     await emit("agent:status", {"agent": "risk", "state": "thinking"})
     plan = judge(
         f, bull, bear, capital=capital, risk_pct=risk_pct, today_loss_pct=today_loss_pct,
-        asset=inst.asset_class, quote_ccy=inst.currency, account_ccy=account_currency,
+        asset=inst.asset_class, quote_ccy=inst.currency, account_ccy=account_currency, news=news,
     )
     verdict = extract_json(await chat(
         settings.model_risk, RISK_SYSTEM,
@@ -344,7 +375,7 @@ async def run_debate(
         if str(verdict.get("verdict", "")).upper() == "WAIT" and plan["status"] != "WAIT":
             plan["status"] = "WAIT"
             plan["reasons"].append("VETO Risk Agent (LLM): bukti dinilai belum cukup")
-    plan["summary"] = summary or " ".join(plan["reasons"])
+    plan["summary"] = summary or plan["reasons"][0]
     plan.update(
         symbol=inst.symbol,
         asset_class=inst.asset_class,
@@ -357,6 +388,7 @@ async def run_debate(
         facts=f.to_dict(),
         bull=bull.to_dict(),
         bear=bear.to_dict(),
+        news=news.to_dict() if news else None,
     )
     await emit("agent:message", {"agent": "risk", "kind": "verdict", "text": plan["summary"]})
     await emit("agent:status", {"agent": "risk", "state": "idle"})

@@ -3,7 +3,7 @@
 import { io, type Socket } from "socket.io-client";
 import { create } from "zustand";
 import { AGENTS, BACKEND_URL, type AgentId, type AgentState, type Dept } from "./agents";
-import type { AgentMessage, AgentStates, Busy, Candle, ItResult, Task, TradingPlan } from "./types";
+import type { AgentMessage, AgentStates, Busy, Candle, ItResult, NewsSentiment, Task, TradingPlan } from "./types";
 
 const BUBBLE_MS = 9000;
 
@@ -20,6 +20,7 @@ interface OfficeState {
   itResult: ItResult | null;
   plan: TradingPlan | null;
   market: { symbol: string; source: string; interval: string; candles: Candle[] } | null;
+  news: NewsSentiment | null;
   focus: Dept | null;
   setFocus: (d: Dept | null) => void;
   analyze: (args: { symbol: string; interval: string; capital?: number; risk_pct?: number; account_currency: string }) => Promise<void>;
@@ -43,6 +44,7 @@ export const useOffice = create<OfficeState>((set, get) => ({
   itResult: null,
   plan: null,
   market: null,
+  news: null,
   focus: null,
   setFocus: (focus) => set({ focus }),
   clearError: () => set({ error: null }),
@@ -50,7 +52,7 @@ export const useOffice = create<OfficeState>((set, get) => ({
   analyze: async (args) => {
     const res = await emitAck("trade:analyze", args);
     if (!res.ok) set({ error: res.error ?? "Gagal memulai analisa" });
-    else set({ plan: null, focus: "trade" });
+    else set({ plan: null, news: null, focus: "trade" });
   },
 
   requestIt: async (prompt) => {
@@ -104,5 +106,6 @@ export function connectOffice() {
   );
   socket.on("it:result", (d: ItResult) => set({ itResult: d }));
   socket.on("trade:market", (d: OfficeState["market"]) => set({ market: d }));
+  socket.on("trade:news", (d: NewsSentiment) => set({ news: d }));
   socket.on("trade:plan", (d: TradingPlan) => set({ plan: d }));
 }

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 
 import socketio
@@ -17,8 +18,9 @@ from .agents.it_department import ROLES, run_it_pipeline
 from .agents.trading import run_debate
 from .config import settings
 from .db import Store
-from .market.data import INTERVALS, load_market
+from .market.data import INTERVALS, load_market, resolve
 from .market.indicators import candles_payload
+from .market.news import empty as empty_news, load_news
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("office")
@@ -66,9 +68,11 @@ async def _trade_job(req: TradeRequest, session_id: str) -> dict:
             "session_id": session_id, "symbol": md.instrument.symbol, "source": md.source,
             "interval": md.interval, "candles": candles_payload(md.candles),
         })
+        news = await load_news(md.instrument) if settings.enable_news else empty_news(md.instrument.symbol)
+        await sio.emit("trade:news", {"session_id": session_id, **news.to_dict()})
         plan = await run_debate(
             md, emit, capital=req.capital, risk_pct=req.risk_pct,
-            today_loss_pct=req.today_loss_pct, account_currency=req.account_currency,
+            today_loss_pct=req.today_loss_pct, account_currency=req.account_currency, news=news,
         )
         plan["session_id"] = session_id
         store.save_plan(session_id, plan)
@@ -133,6 +137,13 @@ async def it_request(req: ItRequest):
     store.create_session(sid, "it", req.prompt)
     asyncio.create_task(_it_job(req, sid))
     return {"session_id": sid}
+
+
+@app.get("/api/news/{symbol}")
+async def news(symbol: str):
+    if not re.fullmatch(r"[A-Za-z0-9./=\-]{2,15}", symbol):
+        raise HTTPException(422, "Simbol tidak valid")
+    return (await load_news(resolve(symbol))).to_dict()
 
 
 @app.get("/api/sessions")

@@ -57,3 +57,15 @@ body {
 ::-webkit-scrollbar-thumb {
   background: #22324f;
 }
+
+/* News ticker on the trading-room wall */
+@keyframes ticker {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+.ticker {
+  animation: ticker 40s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ticker { animation: none; }
+}
