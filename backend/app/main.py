@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import uuid
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -20,7 +21,10 @@ from .agents.it_department import ROLES, run_it_pipeline
 from .agents.trading import run_debate
 from .config import settings
 from .db import Store
+from . import paper
+from .journal import stats as journal_stats
 from .market.data import INTERVALS, load_market, resolve
+from .screener import DEFAULT_UNIVERSE, run_screener
 from .market.indicators import candles_payload
 from .market.news import empty as empty_news, load_news
 from .github.client import GitHubClient, GitHubError
@@ -35,11 +39,31 @@ projects = ProjectStore()
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins=settings.cors_origins)
 
 
+JOURNAL_REFRESH_MIN = float(os.getenv("JOURNAL_REFRESH_MIN", "15"))
+SCREENER_JOURNAL_TOP = int(os.getenv("SCREENER_JOURNAL_TOP", "3"))
+SYMBOL_RE = re.compile(r"^[A-Za-z0-9./=\-]{2,15}$")
+
+
+async def _journal_loop() -> None:
+    """Re-check open paper trades periodically so results appear without clicking anything."""
+    while True:
+        await asyncio.sleep(JOURNAL_REFRESH_MIN * 60)
+        try:
+            res = await paper.refresh(store, load_market)
+            if res["checked"]:
+                await sio.emit("journal:update", res)
+        except Exception:
+            log.exception("journal refresh failed")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await projects.init(migrate=settings.db_auto_migrate)
     log.info("project database: %s", projects.backend)
+    loop = asyncio.create_task(_journal_loop()) if JOURNAL_REFRESH_MIN > 0 else None
     yield
+    if loop:
+        loop.cancel()
     await projects.close()
 
 
@@ -124,9 +148,13 @@ async def _trade_job(req: TradeRequest, session_id: str) -> dict:
             today_loss_pct=req.today_loss_pct, account_currency=req.account_currency, news=news,
         )
         plan["session_id"] = session_id
+        plan["paper_trade_id"] = paper.record_plan(store, plan, session_id=session_id)
         store.save_plan(session_id, plan)
         await sio.emit("trade:plan", plan)
         return plan
+    except LookupError as exc:  # unknown ticker / too little data: a user error, not a crash
+        log.info("trade job: %s", exc)
+        await sio.emit("job:error", {"session_id": session_id, "dept": "trade", "error": str(exc)})
     except Exception as exc:
         log.exception("trade job failed")
         await sio.emit("job:error", {"session_id": session_id, "dept": "trade", "error": str(exc)})
@@ -262,6 +290,8 @@ def agents():
 async def trade_analyze(req: TradeRequest):
     if req.interval not in INTERVALS:
         raise HTTPException(422, f"interval harus salah satu dari {list(INTERVALS)}")
+    if "screener" in _running:
+        raise HTTPException(409, "Screener sedang berjalan, tunggu selesai")
     sid = _claim("trade")
     store.create_session(sid, "trade", req.model_dump_json())
     asyncio.create_task(_trade_job(req, sid))
@@ -363,6 +393,121 @@ async def news(symbol: str):
     return (await load_news(resolve(symbol))).to_dict()
 
 
+# --------------------------------------------------------------------------- watchlist
+class SymbolList(BaseModel):
+    symbols: list[str] = Field(max_length=120)
+
+
+def _clean_symbols(symbols: list[str]) -> list[str]:
+    bad = [s for s in symbols if not SYMBOL_RE.fullmatch(s.strip())]
+    if bad:
+        raise HTTPException(422, f"Simbol tidak valid: {', '.join(bad[:5])}")
+    return list(dict.fromkeys(resolve(s).symbol for s in symbols))
+
+
+@app.get("/api/watchlist")
+def get_watchlist():
+    return {"symbols": store.watchlist()}
+
+
+@app.put("/api/watchlist")
+def put_watchlist(body: SymbolList):
+    store.set_watchlist(_clean_symbols(body.symbols)[:30])
+    return {"symbols": store.watchlist()}
+
+
+# --------------------------------------------------------------------------- paper-trading journal
+@app.get("/api/journal")
+def journal():
+    trades = store.paper_trades(limit=500)
+    return {"stats": journal_stats(trades), "trades": trades[:100]}
+
+
+@app.post("/api/journal/refresh")
+async def journal_refresh():
+    res = await paper.refresh(store, load_market)
+    trades = store.paper_trades(limit=500)
+    return {**res, "stats": journal_stats(trades), "trades": trades[:100]}
+
+
+@app.delete("/api/journal/{trade_id}", status_code=204)
+def journal_delete(trade_id: int):
+    if not store.delete_paper_trade(trade_id):
+        raise HTTPException(404, "Trade tidak ditemukan")
+
+
+# --------------------------------------------------------------------------- screener
+class ScreenerRequest(BaseModel):
+    interval: str = "1d"
+    symbols: list[str] | None = Field(default=None, max_length=120)
+    capital: float | None = Field(default=None, gt=0)
+    risk_pct: float | None = Field(default=None, gt=0, le=10)
+
+
+@app.get("/api/screener/universe")
+def screener_universe():
+    return {"symbols": store.get_setting("screener_universe") or DEFAULT_UNIVERSE, "default": DEFAULT_UNIVERSE}
+
+
+@app.put("/api/screener/universe")
+def put_screener_universe(body: SymbolList):
+    symbols = _clean_symbols(body.symbols)
+    if any(resolve(s).asset_class != "idx_stock" for s in symbols):
+        raise HTTPException(422, "Screener khusus saham BEI (tanpa forex/emas)")
+    store.set_setting("screener_universe", symbols)
+    return {"symbols": symbols}
+
+
+@app.get("/api/screener/last")
+def screener_last():
+    return store.last_screener()
+
+
+async def _screener_job(req: ScreenerRequest, run_id: str) -> None:
+    symbols = req.symbols or store.get_setting("screener_universe") or DEFAULT_UNIVERSE
+    await sio.emit("job:start", {"session_id": run_id, "dept": "screener", "input": f"{len(symbols)} saham"})
+    for agent, state in (("bull", "debating"), ("bear", "debating"), ("risk", "thinking")):
+        await sio.emit("agent:status", {"agent": agent, "state": state})
+
+    async def progress(p: dict) -> None:
+        await sio.emit("screener:progress", {"session_id": run_id, **p})
+
+    try:
+        result = await run_screener(symbols, req.interval, capital=req.capital or settings.default_capital,
+                                    risk_pct=req.risk_pct or settings.default_risk_pct, run_id=run_id, progress=progress)
+        # Track the best picks in the journal so the screener's own hit rate becomes measurable
+        result["journaled"] = [r["symbol"] for r in result["recommendations"][:SCREENER_JOURNAL_TOP]
+                               if paper.record_plan(store, r, source="screener", session_id=run_id)]
+        store.save_screener(run_id, req.interval, result)
+        recs = result["recommendations"]
+        text = (f"Screener: {len(recs)} saham layak beli dari {result['scanned']} yang dipindai. Teratas: "
+                + ", ".join(f"{r['symbol']} @ {r['entry']:,.0f}" for r in recs[:3]) if recs else
+                f"Screener: tidak ada saham yang lolos semua aturan dari {result['scanned']} yang dipindai. WAIT.")
+        await sio.emit("agent:message", {"session_id": run_id, "agent": "risk", "kind": "screener", "text": text})
+        await sio.emit("screener:result", result)
+    except Exception as exc:
+        log.exception("screener failed")
+        await sio.emit("job:error", {"session_id": run_id, "dept": "screener", "error": str(exc)})
+    finally:
+        for agent in ("bull", "bear", "risk"):
+            await sio.emit("agent:status", {"agent": agent, "state": "idle"})
+        _running.discard("screener")
+        await sio.emit("job:end", {"session_id": run_id, "dept": "screener"})
+
+
+@app.post("/api/screener/run", status_code=202)
+async def screener_run(req: ScreenerRequest):
+    if req.interval not in INTERVALS:
+        raise HTTPException(422, f"interval harus salah satu dari {list(INTERVALS)}")
+    if req.symbols:
+        req.symbols = _clean_symbols(req.symbols)
+    if "trade" in _running:
+        raise HTTPException(409, "Arena sedang menganalisa, tunggu selesai")
+    rid = _claim("screener")
+    asyncio.create_task(_screener_job(req, rid))
+    return {"session_id": rid}
+
+
 @app.get("/api/sessions")
 def sessions(limit: int = 20):
     return store.recent_sessions(min(limit, 100))
@@ -393,6 +538,17 @@ async def ws_trade(sid, data):
     except HTTPException as e:
         return {"ok": False, "error": e.detail}
     except Exception as e:  # pydantic validation
+        return {"ok": False, "error": str(e)}
+
+
+@sio.on("screener:run")
+async def ws_screener(sid, data):
+    try:
+        res = await screener_run(ScreenerRequest(**(data or {})))
+        return {"ok": True, **res}
+    except HTTPException as e:
+        return {"ok": False, "error": e.detail}
+    except Exception as e:
         return {"ok": False, "error": str(e)}
 
 

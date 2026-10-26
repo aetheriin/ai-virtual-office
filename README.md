@@ -64,7 +64,7 @@ npm run dev                         # http://localhost:3000
 ### 4. Tes
 
 ```bash
-cd backend && pytest -q             # 91 tes: risk math, debat, sentimen berita, pipeline IT, database, PR GitHub (offline, GitHub palsu)
+cd backend && pytest -q             # 139 tes: risk math, aturan BEI, debat, screener, jurnal, berita, pipeline IT, database, PR GitHub (offline)
 # tes database juga terhadap PostgreSQL sungguhan (skema di DB ini akan di-reset):
 TEST_DATABASE_URL=postgresql://office:office@localhost:5432/office_test pytest -q tests/test_projects.py
 cd frontend && npm test && npm run typecheck && npm run build   # npm test: logika avatar .glb (Node 22+)
@@ -94,6 +94,52 @@ alembic upgrade head                               # terapkan migrasi
 alembic revision --autogenerate -m "tambah kolom"  # buat migrasi baru setelah mengubah app/projects/models.py
 alembic check                                      # pastikan model == migrasi
 ```
+
+## Departemen Investasi: Analisa, Screener & Jurnal
+
+Panel **DEPT. INVESTASI** punya tiga sub-tab:
+
+### Analisa (satu instrumen)
+- **Watchlist.** Klik kode saham/pair untuk langsung analisa. Klik **ATUR WATCHLIST** untuk menambah atau menghapus (mis. `BUVA`, `BUMI`). Kode saham BEI cukup diketik tanpa `.JK`.
+- **Kode salah = error jelas.** `ALLOW_SYNTHETIC_DATA=false` (default) membuat kode yang tidak ada memunculkan pesan "tidak ditemukan", bukan diam-diam memakai data palsu. Saham dengan candle terlalu sedikit diberi saran pindah ke timeframe `1h`/`1d`.
+- **Aturan BEI.**
+  - **TP dibatasi ARA.** Target dipotong di batas ARA hari itu (dari harga penutupan kemarin), karena harga tidak bisa naik melewatinya.
+  - **SL di bawah ARB diberi peringatan.** SL di bawah ARB tidak bisa tersentuh hari itu, jadi ada risiko gap besok.
+  - **Default mengikuti aturan BEI per Oktober 2026:** ARA 35/25/20% sesuai harga; ARB 7% (Rp1 untuk saham Rp11–14) s.d. 31 Des 2026, lalu simetris mulai 2027. Aturan ini sering berubah, jadi ganti lewat `IDX_ARA_PCT`/`IDX_ARB_PCT` bila perlu.
+  - **Papan Akselerasi & Pemantauan Khusus belum dimodelkan.**
+- **Saham tidak bisa short.** Bias turun pada saham ditampilkan sebagai **HINDARI** (bukan sinyal jual-kosong).
+- **Veto data basi.** Analisa saat bursa buka tapi candle terakhir sudah lama ditolak. Analisa di luar jam bursa diberi peringatan. Jam BEI dihitung dalam WIB, termasuk istirahat Jumat. Libur bursa belum dikenali.
+- **Likuiditas.**
+  - Nilai transaksi harian rata-rata < `MIN_DAILY_VALUE_IDR` (default Rp1 M) → veto.
+  - Di bawah `WARN_DAILY_VALUE_IDR` → peringatan.
+  - Ukuran posisi > 1% nilai transaksi harian → peringatan slippage.
+- **MetaTrader5.** Nama simbol broker dideteksi otomatis (`XAUUSDm`, `XAUUSD.r`, `XAUUSD-ECN`, … dipilih yang terpendek). Bisa dipaksa lewat `MT5_SYMBOL_MAP={"XAUUSD":"XAUUSDm"}` atau `MT5_SYMBOL_SUFFIX`.
+
+### Screener: rekomendasi beli otomatis
+Klik **Cari Saham Layak Beli**:
+1. Sistem memindai daftar saham (default ±50 saham BEI besar yang sering ditransaksikan; *bukan* daftar indeks resmi, ubah lewat **UBAH DAFTAR**).
+2. Setiap saham dianalisa dengan aturan yang sama persis dengan Analisa, tanpa LLM supaya cepat dan gratis.
+3. Hasilnya:
+   - **Rekomendasi beli**: hanya saham yang lolos semua veto Risk Agent, diurutkan menurut skor (selisih bukti Bull−Bear, RR, likuiditas), lengkap dengan harga beli, SL, TP1/TP2, RR, dan jumlah lot sesuai modal & risiko.
+   - **Pantau**: bullish tapi belum lolos (RR, ARA, likuiditas, dll.).
+   - **Hindari**: tren turun.
+4. Tombol **Debat-kan** menjalankan analisa lengkap (Bull vs Bear + berita) untuk satu kandidat.
+5. 3 rekomendasi teratas otomatis dicatat di Jurnal, supaya akurasi screener ikut terukur.
+
+Aturannya ketat, jadi **screener sering tidak merekomendasikan apa pun.** Itu wajar: Risk Agent menolak beli tepat di bawah resistance (TP1 < `MIN_RR_TP1`), saat data basi, atau saham tidak likuid. Melonggarkan `MIN_RR_TP1` menambah jumlah sinyal. Pakai Jurnal untuk melihat apakah sinyal tambahan itu benar-benar menguntungkan.
+
+### Jurnal paper trading
+- **Tercatat otomatis.** Setiap plan **BUY/SELL** dari data asli (Analisa, dan 3 teratas Screener) dicatat sebagai trade kertas.
+- **Dinilai otomatis.** Tiap `JOURNAL_REFRESH_MIN` menit (default 15), atau lewat **Cek hasil sekarang**, sistem mengecek candle berikutnya.
+- **Model eksekusi:**
+  - Masuk di harga entry.
+  - Separuh posisi keluar di TP1, stop sisanya pindah ke harga beli (*break-even*), sisanya menargetkan TP2.
+  - Bila satu candle menyentuh stop dan target sekaligus, dianggap kena stop (konservatif).
+  - Trade kedaluwarsa setelah 48 jam (intraday) / 10 hari (`1d`).
+- **Statistik:** jumlah tertutup, win rate, rata-rata dan total **R** (kelipatan risiko), serta P/L kertas dalam rupiah.
+- **Butuh minimal ~30 trade tertutup** sebelum angka ini berarti. Plan dari data sintetis tidak pernah dicatat.
+
+> ⚠️ Rekomendasi screener adalah hasil pemindaian teknikal otomatis, **bukan saran investasi**. Uji dulu lewat Jurnal sebelum memakai uang sungguhan.
 
 ## Pull request otomatis (Departemen IT → GitHub)
 
@@ -176,6 +222,13 @@ Semua model bisa diganti lewat `.env`. ID model gratis di OpenRouter sering beru
 | GET | `/api/sessions`, `/api/sessions/{id}` | riwayat & log debat (SQLite) |
 | GET | `/api/plans?symbol=BBCA` | riwayat trading plan |
 | GET | `/api/news/{symbol}` | sentimen berita saja (tanpa debat) |
+| GET / PUT | `/api/watchlist` | daftar tombol cepat `{symbols}` |
+| POST | `/api/screener/run` | `{interval, symbols?, capital?, risk_pct?}`; hasil lewat event `screener:result` |
+| GET | `/api/screener/last` | hasil screener terakhir |
+| GET / PUT | `/api/screener/universe` | daftar saham yang dipindai |
+| GET | `/api/journal` | trade kertas + statistik |
+| POST | `/api/journal/refresh` | nilai ulang trade terbuka sekarang |
+| DELETE | `/api/journal/{id}` | hapus trade kertas |
 | GET / POST | `/api/projects` | daftar / buat proyek `{name, description, repo?, base_branch?}` |
 | DELETE | `/api/projects/{id}` | hapus proyek beserta semua sprint-nya |
 | PATCH | `/api/projects/{id}` | `{repo, base_branch, description}`; `repo: ""` melepas repo |
@@ -183,7 +236,7 @@ Semua model bisa diganti lewat `.env`. ID model gratis di OpenRouter sering beru
 | GET | `/api/projects/{id}/runs` | riwayat sprint proyek |
 | GET | `/api/it/runs/{id}` | detail sprint: task, kode, temuan QA |
 
-Event Socket.IO: `agent:status`, `agent:message`, `it:tasks`, `it:task_status`, `it:result`, `it:pr`, `trade:market`, `trade:news`, `trade:plan`, `job:start|end|error`.
+Event Socket.IO: `agent:status`, `agent:message`, `it:tasks`, `it:task_status`, `it:result`, `it:pr`, `trade:market`, `trade:news`, `trade:plan`, `screener:progress`, `screener:result`, `journal:update`, `job:start|end|error`.
 
 ## Avatar 3D (.glb)
 
@@ -229,5 +282,6 @@ Cara kerjanya:
 - Suara (TTS) + lip-sync Rhubarb berbasis audio; retarget rig VRM/VRoid.
 - Akun pengguna & login (tabel `users` di PostgreSQL).
 - Agen memperbaiki PR sendiri dari komentar review & hasil CI GitHub.
+- Backtest aturan Bull/Bear/Risk ke data historis; kalender libur BEI; screener terjadwal sebelum bursa buka.
 
 > ⚠️ Bukan saran keuangan. Trading Plan adalah alat bantu analisa; selalu verifikasi sendiri sebelum eksekusi di MetaTrader/sekuritas.

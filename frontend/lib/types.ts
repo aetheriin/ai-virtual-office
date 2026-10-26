@@ -92,6 +92,84 @@ export interface TradingPlan {
   bull: Proposal;
   bear: Proposal;
   news: NewsSentiment | null;
+  warnings: string[];
+  limits: { reference: number; ara: number; arb: number; rule: string } | null;
+  freshness: { last_candle: string; age_minutes: number; market_open: boolean; stale: boolean; note: string } | null;
+  liquidity: { avg_daily_value: number; level: "ok" | "thin" | "illiquid" | "unknown"; note: string } | null;
+  paper_trade_id?: number | null;
+}
+
+export interface ScreenerRow {
+  symbol: string;
+  interval: string;
+  price: number;
+  as_of: string;
+  status: "BUY" | "SELL" | "WAIT";
+  bias: "LONG" | "SHORT";
+  entry: number;
+  stop_loss: number;
+  tp1: number;
+  tp2: number;
+  rr_tp1: number;
+  rr_tp2: number;
+  position: TradingPlan["position"];
+  scores: { bull: number; bear: number };
+  score: number;
+  structure?: string;
+  liquidity: string | null;
+  evidence: string[];
+  reasons: string[];
+  warnings: string[];
+  limits: TradingPlan["limits"];
+  summary: string;
+  demo: boolean;
+}
+
+export interface ScreenerResult {
+  id: string;
+  interval: string;
+  created_at: string;
+  universe: number;
+  scanned: number;
+  errors: Record<string, string>;
+  recommendations: ScreenerRow[];
+  watch: ScreenerRow[];
+  avoid: string[];
+  journaled?: string[];
+  demo: boolean;
+  disclaimer: string;
+}
+
+export interface PaperTrade {
+  id: number;
+  source: string;
+  symbol: string;
+  interval: string;
+  side: "LONG" | "SHORT";
+  entry: number;
+  stop_loss: number;
+  tp1: number;
+  tp2: number;
+  quantity: number | null;
+  unit: string | null;
+  risk_amount: number | null;
+  opened_at: string;
+  status: "open" | "tp1" | "closed";
+  result: "tp2" | "tp1_be" | "sl" | "expired" | null;
+  r_multiple: number | null;
+  exit_price: number | null;
+  closed_at: string | null;
+}
+
+export interface JournalStats {
+  total: number;
+  open: number;
+  closed: number;
+  win_rate: number | null;
+  avg_r: number | null;
+  total_r: number;
+  paper_pnl: number;
+  note: string;
 }
 
 export interface ItResult {
@@ -104,7 +182,7 @@ export interface ItResult {
 }
 
 export type AgentStates = Record<AgentId, AgentState>;
-export type Busy = Record<Dept, boolean>;
+export type Busy = Record<Dept | "screener", boolean>;
 
 export interface Project {
   id: number;

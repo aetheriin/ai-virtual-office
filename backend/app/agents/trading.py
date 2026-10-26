@@ -21,7 +21,8 @@ from ..llm import chat, extract_json
 from ..market.data import MarketData
 from ..market.indicators import MarketFacts, compute_facts
 from ..market.news import NewsSentiment
-from ..risk import position_size, round_price, rr
+from ..market.rules import Freshness, Liquidity, PriceLimits, freshness, idx_price_limits, liquidity, previous_close
+from ..risk import PositionSize, position_size, round_price, rr
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
@@ -51,6 +52,7 @@ class Proposal:
     trigger: str
     thesis: str = ""
     risks: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
     @property
     def rr_tp1(self) -> float:
@@ -64,6 +66,46 @@ class Proposal:
         d = asdict(self)
         d.update(rr_tp1=round(self.rr_tp1, 2), rr_tp2=round(self.rr_tp2, 2))
         return d
+
+
+# --------------------------------------------------------------------------- market context
+@dataclass
+class MarketContext:
+    """Exchange rules and data-quality facts the Risk Agent must respect (see market/rules.py)."""
+
+    limits: PriceLimits | None = None
+    fresh: Freshness | None = None
+    liq: Liquidity | None = None
+
+    @classmethod
+    def from_market(cls, md: MarketData) -> MarketContext:
+        df, asset = md.candles, md.instrument.asset_class
+        limits = None
+        if asset == "idx_stock":
+            ref = previous_close(df, md.interval)
+            limits = idx_price_limits(ref) if ref else None
+        # Synthetic demo candles have no real clock or volume, so skip those checks
+        live = md.is_live
+        return cls(limits, freshness(df, md.interval, asset) if live else None, liquidity(df, md.interval, asset) if live else None)
+
+    def to_dict(self) -> dict:
+        return {"limits": self.limits and self.limits.to_dict(), "freshness": self.fresh and self.fresh.to_dict(),
+                "liquidity": self.liq and self.liq.to_dict()}
+
+
+def cap_to_limits(p: Proposal, limits: PriceLimits | None, asset: str) -> Proposal:
+    """A LONG target above today's ARA can't fill today: pull TP1/TP2 down to ARA."""
+    if not limits or p.side != "LONG":
+        return p
+    if p.entry >= limits.ara:
+        p.notes.append(f"Harga sudah di ARA ({fmt(limits.ara)}): tidak bisa naik lagi hari ini, rawan antre beli tak terisi")
+    if p.tp1 > limits.ara or p.tp2 > limits.ara:
+        p.notes.append(f"Target dibatasi ARA hari ini {fmt(limits.ara)} (acuan {fmt(limits.reference)})")
+        p.tp1 = min(p.tp1, limits.ara)
+        p.tp2 = min(p.tp2, limits.ara)
+    if p.stop_loss < limits.arb:
+        p.notes.append(f"SL {fmt(p.stop_loss)} di bawah ARB {fmt(limits.arb)}: tidak bisa tersentuh hari ini, risiko gap besok")
+    return p
 
 
 # --------------------------------------------------------------------------- rule engines
@@ -218,25 +260,36 @@ def judge(
     quote_ccy: str,
     account_ccy: str,
     news: NewsSentiment | None = None,
+    ctx: MarketContext | None = None,
 ) -> dict:
     """Risk Agent's hard rules. Returns the trading plan dict."""
+    ctx = ctx or MarketContext()
     reasons: list[str] = []
+    warnings: list[str] = []
     status = "WAIT"
     chosen: Proposal | None = None
+    stock = asset == "idx_stock"
 
     gap = bull.score - bear.score
     if today_loss_pct >= settings.max_daily_loss_pct:
         reasons.append(f"VETO: batas rugi harian {settings.max_daily_loss_pct}% sudah tercapai ({today_loss_pct}%)")
+    elif ctx.fresh and ctx.fresh.stale:
+        reasons.append(f"VETO: {ctx.fresh.note}")
+    elif ctx.liq and ctx.liq.level == "illiquid":
+        reasons.append(f"VETO: saham tidak likuid — {ctx.liq.note}")
     elif f.atr_pct > MAX_INTRADAY_ATR_PCT:
         reasons.append(f"VETO: volatilitas ekstrem (ATR {f.atr_pct:.2f}% > {MAX_INTRADAY_ATR_PCT}%)")
     elif abs(gap) < MIN_EVIDENCE_GAP:
         reasons.append(f"Bukti seimbang (Bull {bull.score:g} vs Bear {bear.score:g}); selisih < {MIN_EVIDENCE_GAP:g}")
     else:
         cand = bull if gap > 0 else bear
-        if cand.rr_tp2 < settings.min_rr:
+        if stock and cand.side == "SHORT":
+            reasons.append(f"Bias TURUN (Bear unggul {abs(gap):g} poin): hindari beli; bila sudah punya, pertimbangkan "
+                           "jual/kurangi. Short tidak tersedia untuk ritel di BEI.")
+        elif cand.rr_tp2 < settings.min_rr:
             reasons.append(f"VETO: RR {cand.side} ke TP2 hanya 1:{cand.rr_tp2:.2f} (< 1:{settings.min_rr})")
-        elif cand.rr_tp1 < 1.0:
-            reasons.append(f"VETO: TP1 {cand.side} terlalu dekat (RR 1:{cand.rr_tp1:.2f})")
+        elif cand.rr_tp1 < settings.min_rr_tp1:
+            reasons.append(f"VETO: TP1 {cand.side} terlalu dekat resistance/support (RR 1:{cand.rr_tp1:.2f} < 1:{settings.min_rr_tp1:g})")
         elif news and news.strong and news.score * (1 if cand.side == "LONG" else -1) < 0:
             reasons.append(f"VETO: sentimen berita kuat melawan {cand.side} ({news.score:+.2f}, {news.count} berita)")
         else:
@@ -244,16 +297,27 @@ def judge(
             status = "BUY" if cand.side == "LONG" else "SELL"
             reasons.append(f"{cand.side} unggul {abs(gap):g} poin bukti; RR TP1 1:{cand.rr_tp1:.2f}, TP2 1:{cand.rr_tp2:.2f}")
     if news and news.event_risk:
-        reasons.append("Peringatan: ada rilis data berdampak tinggi baru-baru ini; pertimbangkan ukuran posisi lebih kecil")
+        warnings.append("Ada rilis data berdampak tinggi baru-baru ini; pertimbangkan ukuran posisi lebih kecil")
 
     ref = chosen or (bull if gap >= 0 else bear)
-    size = position_size(
-        capital=capital, risk_pct=risk_pct, entry=ref.entry, stop=ref.stop_loss,
-        asset_class=asset, account_currency=account_ccy, quote_currency=quote_ccy,
-    )
+    if stock and ref.side == "SHORT":
+        size = PositionSize(0, "lot (100 lembar)", capital * risk_pct / 100, 0, 0, "Saham tidak bisa short: posisi tidak dihitung")
+    else:
+        size = position_size(
+            capital=capital, risk_pct=risk_pct, entry=ref.entry, stop=ref.stop_loss,
+            asset_class=asset, account_currency=account_ccy, quote_currency=quote_ccy,
+        )
     if chosen and size.quantity <= 0:
         status = "WAIT"
         reasons.append(f"VETO: {size.note}")
+
+    warnings += ref.notes
+    if ctx.fresh and not ctx.fresh.market_open:
+        warnings.append(ctx.fresh.note)
+    if ctx.liq and ctx.liq.level == "thin":
+        warnings.append(f"Likuiditas tipis: {ctx.liq.note}; pakai limit order, hindari market order")
+    if ctx.liq and ctx.liq.avg_daily_value > 0 and size.notional > 0.01 * ctx.liq.avg_daily_value:
+        warnings.append(f"Ukuran posisi > 1% nilai transaksi harian (Rp{size.notional / 1e6:,.0f} jt): rawan slippage")
     return {
         "status": status,
         "bias": ref.side,
@@ -269,6 +333,8 @@ def judge(
         "risk_pct": risk_pct,
         "scores": {"bull": bull.score, "bear": bear.score},
         "reasons": reasons,
+        "warnings": warnings,
+        **ctx.to_dict(),
     }
 
 
@@ -326,10 +392,11 @@ async def run_debate(
     risk_pct = risk_pct or settings.default_risk_pct
     inst = md.instrument
     f = compute_facts(md.candles)
+    mctx = MarketContext.from_market(md)
     brief = _facts_brief(md, f, news)
 
     await emit("agent:status", {"agent": "bull", "state": "debating"})
-    bull = bull_case(f, inst.asset_class, news)
+    bull = cap_to_limits(bull_case(f, inst.asset_class, news), mctx.limits, inst.asset_class)
     bull.thesis = await chat(
         settings.model_debate, BULL_SYSTEM,
         f"DATA:\n{brief}\n\nBUKTI TERHITUNG:\n{json.dumps(bull.evidence, ensure_ascii=False)}\n"
@@ -361,7 +428,7 @@ async def run_debate(
     await emit("agent:status", {"agent": "risk", "state": "thinking"})
     plan = judge(
         f, bull, bear, capital=capital, risk_pct=risk_pct, today_loss_pct=today_loss_pct,
-        asset=inst.asset_class, quote_ccy=inst.currency, account_ccy=account_currency, news=news,
+        asset=inst.asset_class, quote_ccy=inst.currency, account_ccy=account_currency, news=news, ctx=mctx,
     )
     verdict = extract_json(await chat(
         settings.model_risk, RISK_SYSTEM,

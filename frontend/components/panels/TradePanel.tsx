@@ -5,12 +5,66 @@ import { useOffice } from "@/lib/store";
 import { NewsCard } from "./NewsCard";
 import { PlanCard } from "./PlanCard";
 
-const QUICK = ["BBCA", "BBRI", "TLKM", "XAUUSD", "EURUSD", "USDJPY"];
 const INTERVALS = ["5m", "15m", "30m", "1h", "1d"];
+const SYMBOL_RE = /^[A-Za-z0-9./=-]{2,15}$/;
 
+/** Quick-analysis buttons; the list is editable and stored on the backend. */
+function Watchlist({ onPick, disabled }: { onPick: (s: string) => void; disabled: boolean }) {
+  const watchlist = useOffice((s) => s.watchlist);
+  const save = useOffice((s) => s.saveWatchlist);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState<string[]>([]);
+  const [input, setInput] = useState("");
+
+  function add() {
+    const items = input.split(/[\s,]+/).map((x) => x.trim().toUpperCase().replace(/\.JK$/, "")).filter(Boolean);
+    const valid = items.filter((x) => SYMBOL_RE.test(x));
+    setDraft([...new Set([...draft, ...valid])].slice(0, 30));
+    setInput("");
+  }
+
+  if (editing) {
+    return (
+      <div className="panel space-y-2 p-2">
+        <div className="flex flex-wrap gap-1.5">
+          {draft.map((q) => (
+            <span key={q} className="font-pixel flex items-center gap-1 rounded-sm border border-neon-green/40 px-2 py-1 text-[9px] text-neon-green">
+              {q}
+              <button onClick={() => setDraft(draft.filter((x) => x !== q))} aria-label={`Hapus ${q}`} className="text-white/50 hover:text-neon-red">✕</button>
+            </span>
+          ))}
+          {draft.length === 0 && <span className="font-term text-white/40">Watchlist kosong</span>}
+        </div>
+        <form className="flex gap-1" onSubmit={(e) => { e.preventDefault(); add(); }}>
+          <input className="field" placeholder="Tambah kode, mis. BUVA BUMI XAUUSD" value={input} onChange={(e) => setInput(e.target.value)} />
+          <button type="submit" className="btn border-neon-green/60 text-neon-green">+</button>
+        </form>
+        <div className="flex gap-2">
+          <button onClick={async () => { if (await save(draft)) setEditing(false); }} className="btn flex-1 border-neon-green text-neon-green hover:bg-neon-green/10">Simpan</button>
+          <button onClick={() => setEditing(false)} className="btn border-night-600 text-white/60">Batal</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {watchlist.map((q) => (
+        <button key={q} disabled={disabled} onClick={() => onPick(q)} className="btn border-neon-green/50 text-neon-green hover:bg-neon-green/10">
+          {q}
+        </button>
+      ))}
+      <button onClick={() => { setDraft(watchlist); setEditing(true); }} className="font-pixel px-1 text-[8px] text-neon-cyan hover:underline">
+        ATUR WATCHLIST
+      </button>
+    </div>
+  );
+}
+
+/** Single-instrument analysis: Bull vs Bear vs Risk. */
 export function TradePanel() {
   const analyze = useOffice((s) => s.analyze);
-  const busy = useOffice((s) => s.busy.trade);
+  const busy = useOffice((s) => s.busy.trade || s.busy.screener);
   const connected = useOffice((s) => s.connected);
   const plan = useOffice((s) => s.plan);
   const news = useOffice((s) => s.news);
@@ -34,14 +88,7 @@ export function TradePanel() {
 
   return (
     <div className="space-y-3">
-      <div className="flex flex-wrap gap-1.5">
-        {QUICK.map((q) => (
-          <button key={q} disabled={busy || !connected} onClick={() => run(q)}
-            className="btn border-neon-green/50 text-neon-green hover:bg-neon-green/10">
-            Analisa {q}
-          </button>
-        ))}
-      </div>
+      <Watchlist onPick={run} disabled={busy || !connected} />
 
       <form className="grid grid-cols-2 gap-2" onSubmit={(e) => { e.preventDefault(); run(); }}>
         <label className="col-span-1">
@@ -70,7 +117,7 @@ export function TradePanel() {
         {formError && <p className="font-term col-span-2 text-neon-red" role="alert">{formError}</p>}
         <button type="submit" disabled={busy || !connected}
           className="btn col-span-2 border-neon-orange text-neon-orange hover:bg-neon-orange/10">
-          {busy ? "Bull vs Bear sedang berdebat..." : "Mulai Debat"}
+          {busy ? "Arena sedang sibuk..." : "Mulai Debat"}
         </button>
       </form>
 

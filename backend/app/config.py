@@ -43,11 +43,18 @@ class Settings:
     news_lookback_hours: float = _float("NEWS_LOOKBACK_HOURS", 24)
     news_use_llm: bool = _bool("NEWS_USE_LLM", True)
     enable_news: bool = _bool("ENABLE_NEWS", True)
-    allow_synthetic_data: bool = _bool("ALLOW_SYNTHETIC_DATA", True)
+    # Demo only: invent candles when no live source answers. Off by default so a typo in a ticker
+    # gives a clear "not found" error instead of a convincing-looking fake chart.
+    allow_synthetic_data: bool = _bool("ALLOW_SYNTHETIC_DATA", False)
+    # MetaTrader5: brokers rename symbols (XAUUSDm, XAUUSD.r ...). JSON map and/or suffix; auto-detect otherwise.
+    mt5_symbol_map: str = os.getenv("MT5_SYMBOL_MAP", "")
+    mt5_symbol_suffix: str = os.getenv("MT5_SYMBOL_SUFFIX", "")
 
     default_capital: float = _float("DEFAULT_CAPITAL", 10_000_000)
     default_risk_pct: float = _float("DEFAULT_RISK_PCT", 1.0)
     min_rr: float = _float("MIN_RR", 1.5)
+    # TP1 (nearest resistance) must be at least this many R away; lower it to accept trades closer to resistance
+    min_rr_tp1: float = _float("MIN_RR_TP1", 1.0)
     max_daily_loss_pct: float = _float("MAX_DAILY_LOSS_PCT", 3.0)
 
     cors_origins: list[str] = field(

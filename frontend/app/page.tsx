@@ -4,7 +4,7 @@ import dynamic from "next/dynamic";
 import { useEffect, useState } from "react";
 import { ItPanel } from "@/components/panels/ItPanel";
 import { LogFeed } from "@/components/panels/LogFeed";
-import { TradePanel } from "@/components/panels/TradePanel";
+import { FinancePanel } from "@/components/panels/FinancePanel";
 import type { Dept } from "@/lib/agents";
 import { loadAvatarManifest } from "@/lib/avatars";
 import { connectOffice, useOffice } from "@/lib/store";
@@ -81,7 +81,7 @@ export default function Home() {
               {panelOpen ? "—" : "+"}
             </button>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto p-3">{tab === "trade" ? <TradePanel /> : <ItPanel />}</div>
+          <div className="min-h-0 flex-1 overflow-y-auto p-3">{tab === "trade" ? <FinancePanel /> : <ItPanel />}</div>
         </div>
       </aside>
 

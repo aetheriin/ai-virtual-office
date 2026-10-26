@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
+import re
 from dataclasses import dataclass
 
 import httpx
@@ -36,6 +38,17 @@ INTERVALS = {  # interval -> (yfinance period, twelve data interval)
     "1h": ("1mo", "1h"),
     "1d": ("1y", "1day"),
 }
+
+
+MIN_CANDLES = 30
+
+
+class SymbolNotFound(LookupError):
+    """No source knows this ticker (typo, delisted, or not on Yahoo/Twelve Data/MT5)."""
+
+
+class InsufficientData(LookupError):
+    """The ticker exists but has too few candles for this timeframe (illiquid stock, new listing)."""
 
 
 @dataclass
@@ -114,8 +127,29 @@ def _from_twelvedata(inst: Instrument, interval: str) -> pd.DataFrame | None:
     return _clean(df)
 
 
+def mt5_symbol_name(wanted: str, available: list[str], mapping: str = "", suffix: str = "") -> str | None:
+    """Find the broker's name for a symbol: explicit map > suffix > exact > 'XAUUSD' + broker suffix.
+
+    Brokers append suffixes such as XAUUSDm, XAUUSD.r, XAUUSD-ECN, XAUUSD_i; when several match,
+    the shortest wins (usually the standard account).
+    """
+    names = set(available)
+    try:
+        explicit = json.loads(mapping).get(wanted) if mapping else None
+    except (ValueError, AttributeError):
+        explicit = None
+    for candidate in (explicit, wanted + suffix if suffix else None, wanted):
+        if candidate and candidate in names:
+            return candidate
+    pattern = re.compile(rf"^{re.escape(wanted)}[._\-#]?[A-Za-z0-9]{{0,6}}$", re.I)
+    matches = sorted((n for n in names if pattern.match(n)), key=lambda n: (len(n), n))
+    return matches[0] if matches else None
+
+
 def _from_mt5(inst: Instrument, interval: str) -> pd.DataFrame | None:
     """MetaTrader5 only works on Windows with a running terminal; skipped elsewhere."""
+    if inst.asset_class == "idx_stock":
+        return None  # IDX stocks come from Yahoo; MT5 brokers here are forex/CFD
     try:
         import MetaTrader5 as mt5  # type: ignore
     except ImportError:
@@ -125,7 +159,13 @@ def _from_mt5(inst: Instrument, interval: str) -> pd.DataFrame | None:
     if not mt5.initialize():
         return None
     try:
-        rates = mt5.copy_rates_from_pos(inst.symbol, tf, 0, 300)
+        name = mt5_symbol_name(inst.symbol, [s.name for s in (mt5.symbols_get() or [])],
+                               settings.mt5_symbol_map, settings.mt5_symbol_suffix)
+        if not name:
+            log.warning("MT5: no broker symbol for %s (set MT5_SYMBOL_MAP)", inst.symbol)
+            return None
+        mt5.symbol_select(name, True)  # make sure the terminal streams it
+        rates = mt5.copy_rates_from_pos(name, tf, 0, 300)
     finally:
         mt5.shutdown()
     if rates is None or len(rates) == 0:
@@ -154,22 +194,84 @@ def synthetic_candles(seed_text: str, n: int = 200, start_price: float | None = 
     return pd.DataFrame({"open": opens, "high": highs, "low": lows, "close": closes, "volume": vols}, index=idx)
 
 
+def _synthetic(inst: Instrument, interval: str) -> MarketData:
+    start = {"forex": 1.1, "gold": 2400.0, "metal": 30.0, "crypto": 60_000.0}.get(inst.asset_class)
+    return MarketData(inst, interval, synthetic_candles(inst.symbol + interval, start_price=start), "synthetic")
+
+
+def _not_found(inst: Instrument, interval: str, best: int) -> LookupError:
+    if best:
+        return InsufficientData(
+            f"{inst.symbol}: hanya {best} candle di timeframe {interval} (butuh {MIN_CANDLES}). "
+            "Saham kurang likuid atau baru listing; coba timeframe 1h/1d."
+        )
+    where = "Yahoo Finance (" + inst.yf_ticker + ")" + (", Twelve Data" if settings.twelve_data_api_key else "")
+    return SymbolNotFound(f"Kode '{inst.symbol}' tidak ditemukan di {where}. Cek ejaan kodenya.")
+
+
 def _load_sync(symbol: str, interval: str) -> MarketData:
     if interval not in INTERVALS:
         raise ValueError(f"Unsupported interval {interval!r}; choose one of {list(INTERVALS)}")
     inst = resolve(symbol)
+    best = 0
     for name, loader in (("mt5", _from_mt5), ("yfinance", _from_yfinance), ("twelvedata", _from_twelvedata)):
         try:
             df = loader(inst, interval)
         except Exception as exc:
             log.warning("%s failed for %s: %s", name, inst.symbol, exc)
             df = None
-        if df is not None and len(df) >= 30:
-            return MarketData(inst, interval, df.tail(300), name)
-    if not settings.allow_synthetic_data:
-        raise RuntimeError(f"No market data available for {inst.symbol}")
-    start = {"forex": 1.1, "gold": 2400.0, "metal": 30.0, "crypto": 60_000.0}.get(inst.asset_class)
-    return MarketData(inst, interval, synthetic_candles(inst.symbol + interval, start_price=start), "synthetic")
+        if df is not None:
+            best = max(best, len(df))
+            if len(df) >= MIN_CANDLES:
+                return MarketData(inst, interval, df.tail(300), name)
+    if settings.allow_synthetic_data:
+        return _synthetic(inst, interval)
+    raise _not_found(inst, interval, best)
+
+
+def _download_many(insts: list[Instrument], interval: str) -> dict[str, pd.DataFrame]:
+    """One yfinance request for many tickers (screener); missing tickers are simply absent."""
+    try:
+        import yfinance as yf
+    except ImportError:
+        return {}
+    tickers = [i.yf_ticker for i in insts]
+    raw = yf.download(tickers, period=INTERVALS[interval][0], interval=interval, group_by="ticker",
+                      auto_adjust=False, threads=True, progress=False)
+    out: dict[str, pd.DataFrame] = {}
+    if raw is None or raw.empty:
+        return out
+    for inst in insts:
+        try:
+            part = raw[inst.yf_ticker] if isinstance(raw.columns, pd.MultiIndex) else raw
+            part = _clean(part)
+        except (KeyError, ValueError):
+            continue
+        if len(part):
+            out[inst.symbol] = part
+    return out
+
+
+def load_many_sync(symbols: list[str], interval: str) -> tuple[dict[str, MarketData], dict[str, str]]:
+    """(data per symbol, error per symbol). Batch download first, per-symbol fallback for the rest."""
+    insts = {resolve(s).symbol: resolve(s) for s in symbols}
+    data: dict[str, MarketData] = {}
+    errors: dict[str, str] = {}
+    try:
+        batch = _download_many(list(insts.values()), interval)
+    except Exception as exc:
+        log.warning("batch download failed: %s", exc)
+        batch = {}
+    for sym, inst in insts.items():
+        df = batch.get(sym)
+        if df is not None and len(df) >= MIN_CANDLES:
+            data[sym] = MarketData(inst, interval, df.tail(300), "yfinance")
+            continue
+        try:
+            data[sym] = _load_sync(sym, interval)
+        except LookupError as exc:
+            errors[sym] = str(_not_found(inst, interval, len(df)) if df is not None and len(df) else exc)
+    return data, errors
 
 
 async def load_market(symbol: str, interval: str = "15m") -> MarketData:

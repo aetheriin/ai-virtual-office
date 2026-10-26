@@ -4,8 +4,8 @@ import { io, type Socket } from "socket.io-client";
 import { create } from "zustand";
 import { AGENTS, BACKEND_URL, type AgentId, type AgentState, type Dept } from "./agents";
 import type {
-  AgentMessage, AgentStates, Busy, Candle, ItResult, NewsSentiment, Project, PullRequestInfo, RunDetail, RunSummary, Task,
-  TradingPlan,
+  AgentMessage, AgentStates, Busy, Candle, ItResult, JournalStats, NewsSentiment, PaperTrade, Project, PullRequestInfo,
+  RunDetail, RunSummary, ScreenerResult, Task, TradingPlan,
 } from "./types";
 
 export const BUBBLE_MS = 9000;
@@ -34,6 +34,14 @@ interface OfficeState {
   /** Pull request of the live sprint (or of the sprint opened from history) */
   pr: PullRequestInfo | null;
   github: { configured: boolean; login?: string; error?: string } | null;
+  watchlist: string[];
+  saveWatchlist: (symbols: string[]) => Promise<boolean>;
+  screener: { result: ScreenerResult | null; progress: { stage: string; done: number; total: number } | null; universe: string[] };
+  runScreener: (args: { interval: string; capital?: number; risk_pct?: number }) => Promise<void>;
+  saveUniverse: (symbols: string[]) => Promise<boolean>;
+  journal: { stats: JournalStats | null; trades: PaperTrade[]; loading: boolean };
+  loadJournal: (refresh?: boolean) => Promise<void>;
+  deleteTrade: (id: number) => Promise<void>;
   loadProjects: () => Promise<void>;
   selectProject: (id: number) => Promise<void>;
   createProject: (p: { name: string; description: string; repo?: string; base_branch?: string }) => Promise<boolean>;
@@ -52,7 +60,7 @@ let msgSeq = 0;
 export const useOffice = create<OfficeState>((set, get) => ({
   connected: false,
   llmEnabled: false,
-  busy: { it: false, trade: false },
+  busy: { it: false, trade: false, screener: false },
   error: null,
   states: idleStates(),
   messages: [],
@@ -70,6 +78,40 @@ export const useOffice = create<OfficeState>((set, get) => ({
   viewingRun: null,
   pr: null,
   github: null,
+  watchlist: [],
+  screener: { result: null, progress: null, universe: [] },
+  journal: { stats: null, trades: [], loading: false },
+
+  saveWatchlist: async (symbols) => {
+    const res = (await send("PUT", "/api/watchlist", { symbols })) as { symbols: string[] } | null;
+    if (res) set({ watchlist: res.symbols });
+    return !!res;
+  },
+
+  runScreener: async (args) => {
+    const res = await emitAck("screener:run", args);
+    if (!res.ok) set({ error: res.error ?? "Gagal menjalankan screener" });
+    else set({ screener: { ...get().screener, progress: { stage: "download", done: 0, total: 0 } }, focus: "trade" });
+  },
+
+  saveUniverse: async (symbols) => {
+    const res = (await send("PUT", "/api/screener/universe", { symbols })) as { symbols: string[] } | null;
+    if (res) set({ screener: { ...get().screener, universe: res.symbols } });
+    return !!res;
+  },
+
+  loadJournal: async (refresh = false) => {
+    set({ journal: { ...get().journal, loading: true } });
+    const res = refresh
+      ? ((await send("POST", "/api/journal/refresh", {})) as { stats: JournalStats; trades: PaperTrade[] } | null)
+      : await api<{ stats: JournalStats; trades: PaperTrade[] }>("/api/journal");
+    set({ journal: res ? { stats: res.stats, trades: res.trades, loading: false } : { ...get().journal, loading: false } });
+  },
+
+  deleteTrade: async (id) => {
+    const res = await fetch(`${BACKEND_URL}/api/journal/${id}`, { method: "DELETE" }).catch(() => null);
+    if (res?.ok) await get().loadJournal();
+  },
   setFocus: (focus) => set({ focus }),
 
   loadProjects: async () => {
@@ -181,18 +223,25 @@ export function connectOffice() {
 
   socket.on("connect", () => set({ connected: true }));
   socket.on("disconnect", () => set({ connected: false }));
-  socket.on("hello", (d: { llm_enabled: boolean; busy: Dept[]; project_db?: string }) => {
-    set({ llmEnabled: d.llm_enabled, projectDb: d.project_db ?? null, busy: { it: d.busy.includes("it"), trade: d.busy.includes("trade") } });
+  socket.on("hello", (d: { llm_enabled: boolean; busy: (Dept | "screener")[]; project_db?: string }) => {
+    set({ llmEnabled: d.llm_enabled, projectDb: d.project_db ?? null, busy: { it: d.busy.includes("it"), trade: d.busy.includes("trade"), screener: d.busy.includes("screener") } });
     void get().loadProjects();
     void api<OfficeState["github"]>("/api/github/status").then((g) => set({ github: g }));
+    void api<{ symbols: string[] }>("/api/watchlist").then((w) => w && set({ watchlist: w.symbols }));
+    void api<{ symbols: string[] }>("/api/screener/universe").then((u) => u && set({ screener: { ...get().screener, universe: u.symbols } }));
+    void api<ScreenerResult | null>("/api/screener/last").then((r) => r && set({ screener: { ...get().screener, result: r } }));
+    void get().loadJournal();
   });
 
-  socket.on("job:start", (d: { dept: Dept }) => set({ busy: { ...get().busy, [d.dept]: true } }));
-  socket.on("job:end", (d: { dept: Dept }) => {
+  socket.on("job:start", (d: { dept: Dept | "screener" }) => set({ busy: { ...get().busy, [d.dept]: true } }));
+  socket.on("job:end", (d: { dept: Dept | "screener" }) => {
     set({ busy: { ...get().busy, [d.dept]: false } });
     if (d.dept === "it") void get().loadProjects().then(() => { const id = get().projectId; if (id) void get().selectProject(id); });
   });
-  socket.on("job:error", (d: { error: string }) => set({ error: d.error, states: idleStates() }));
+  socket.on("job:error", (d: { error: string; dept?: string }) => {
+    set({ error: d.error, states: idleStates() });
+    if (d.dept === "screener") set({ screener: { ...get().screener, progress: null } });
+  });
 
   socket.on("agent:status", (d: { agent: AgentId; state: AgentState }) =>
     set({ states: { ...get().states, [d.agent]: d.state } }),
@@ -215,5 +264,15 @@ export function connectOffice() {
     set({ pr: { status: "none", url: null, number: null, branch: null, error: null, ...d } as PullRequestInfo }));
   socket.on("trade:market", (d: OfficeState["market"]) => set({ market: d }));
   socket.on("trade:news", (d: NewsSentiment) => set({ news: d }));
-  socket.on("trade:plan", (d: TradingPlan) => set({ plan: d }));
+  socket.on("trade:plan", (d: TradingPlan) => {
+    set({ plan: d });
+    if (d.paper_trade_id) void get().loadJournal();
+  });
+  socket.on("screener:progress", (d: { stage: string; done: number; total: number }) =>
+    set({ screener: { ...get().screener, progress: d } }));
+  socket.on("screener:result", (d: ScreenerResult) => {
+    set({ screener: { ...get().screener, result: d, progress: null } });
+    void get().loadJournal();
+  });
+  socket.on("journal:update", () => void get().loadJournal());
 }

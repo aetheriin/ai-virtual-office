@@ -7,6 +7,7 @@ const STATUS_STYLE = {
   BUY: { color: "#4dff7c", shadow: "shadow-neon", label: "BUY / LONG" },
   SELL: { color: "#ff4d5e", shadow: "shadow-neon-red", label: "SELL / SHORT" },
   WAIT: { color: "#ff8a2a", shadow: "shadow-neon-orange", label: "WAIT" },
+  AVOID: { color: "#ff4d5e", shadow: "shadow-neon-red", label: "HINDARI" },
 } as const;
 
 export function fmtNum(v: number, digits?: number) {
@@ -25,7 +26,9 @@ function Row({ label, value, color }: { label: string; value: string; color?: st
 
 export function PlanCard({ plan }: { plan: TradingPlan }) {
   const market = useOffice((s) => s.market);
-  const st = STATUS_STYLE[plan.status];
+  // A bearish stock can't be shorted on IDX: show it as "avoid" rather than a bare WAIT
+  const avoid = plan.asset_class === "idx_stock" && plan.status === "WAIT" && plan.bias === "SHORT";
+  const st = STATUS_STYLE[avoid ? "AVOID" : plan.status];
   const ccy = plan.account_currency;
   const total = plan.scores.bull + plan.scores.bear || 1;
   const isWait = plan.status === "WAIT";
@@ -43,6 +46,12 @@ export function PlanCard({ plan }: { plan: TradingPlan }) {
         </div>
       )}
 
+      {plan.warnings?.length > 0 && (
+        <ul className="font-term mt-2 space-y-0.5 rounded-sm border border-neon-orange/50 bg-neon-orange/10 px-2 py-1 text-[16px] leading-5 text-neon-orange">
+          {plan.warnings.map((w) => <li key={w}>⚠ {w}</li>)}
+        </ul>
+      )}
+
       <div className="mt-2 flex items-center gap-3">
         <div className="font-pixel rounded-sm border-2 px-3 py-2 text-[14px]" style={{ color: st.color, borderColor: st.color, textShadow: `0 0 8px ${st.color}` }}>
           {st.label}
@@ -54,7 +63,7 @@ export function PlanCard({ plan }: { plan: TradingPlan }) {
         </div>
       </div>
 
-      {market && market.symbol === plan.symbol && (
+      {market && market.symbol === plan.symbol && !avoid && (
         <div className="mt-2 overflow-hidden rounded-sm border border-night-600">
           <MiniChart
             candles={market.candles}
@@ -68,6 +77,12 @@ export function PlanCard({ plan }: { plan: TradingPlan }) {
         </div>
       )}
 
+      {avoid ? (
+        <p className="font-term mt-2 text-lg leading-5 text-white/75">
+          Tren turun: tidak ada level beli. Saham tidak bisa di-short di BEI, jadi tidak ada entry/SL/TP untuk dieksekusi.
+          Tunggu struktur kembali bullish sebelum menganalisa ulang.
+        </p>
+      ) : (
       <div className={`font-term mt-2 grid grid-cols-1 gap-x-4 text-lg ${isWait ? "opacity-70" : ""}`}>
         <Row label="Entry" value={fmtNum(plan.entry)} color="#5fe6ff" />
         <Row label="Stop Loss" value={fmtNum(plan.stop_loss)} color="#ff4d5e" />
@@ -76,7 +91,22 @@ export function PlanCard({ plan }: { plan: TradingPlan }) {
         <Row label="Ukuran" value={`${fmtNum(plan.position.quantity, 2)} ${plan.position.unit}`} />
         <Row label={`Risiko (${plan.risk_pct}%)`} value={`${ccy} ${fmtNum(plan.position.max_loss, 0)}`} />
       </div>
+      )}
       {plan.position.note && <p className="font-term mt-1 text-white/50">* {plan.position.note}</p>}
+      {plan.limits && (
+        <p className="font-term mt-1 text-[16px] text-white/55">
+          ARA {fmtNum(plan.limits.ara)} · ARB {fmtNum(plan.limits.arb)} (acuan {fmtNum(plan.limits.reference)}) · {plan.limits.rule}
+        </p>
+      )}
+      {(plan.freshness || plan.liquidity) && (
+        <p className="font-term text-[15px] text-white/45">
+          {plan.freshness?.note}{plan.freshness && plan.liquidity?.level !== "unknown" && plan.liquidity ? " · " : ""}
+          {plan.liquidity?.level !== "unknown" ? plan.liquidity?.note : ""}
+        </p>
+      )}
+      {plan.paper_trade_id && (
+        <p className="font-term text-[15px] text-neon-cyan">📓 Tercatat di Jurnal paper trading (#{plan.paper_trade_id}); hasilnya dicek otomatis.</p>
+      )}
 
       <div className="mt-3">
         <div className="font-pixel mb-1 flex justify-between text-[8px]">
