@@ -56,7 +56,22 @@ def run_summary(r: ItRun) -> dict:
         "id": r.id, "project_id": r.project_id, "prompt": r.prompt, "status": r.status,
         "summary": r.summary, "review_verdict": r.review_verdict,
         "created_at": _iso(r.created_at), "finished_at": _iso(r.finished_at),
+        "pr": {"status": r.pr_status, "url": r.pr_url, "number": r.pr_number, "branch": r.pr_branch, "error": r.pr_error},
     }
+
+
+def project_dict(p: Project, runs: int = 0, last: datetime | None = None) -> dict:
+    return {"id": p.id, "name": p.name, "description": p.description, "repo": p.repo_full_name,
+            "base_branch": p.base_branch, "runs": runs, "last_run_at": _iso(last), "created_at": _iso(p.created_at)}
+
+
+def _render_files(files: list[ItArtifact]) -> str:
+    """Rebuild the agent's '### FILE:' reply from stored artifacts (history view)."""
+    parts = []
+    for a in files:
+        block = f"```{a.language}\n{a.content.rstrip()}\n```"
+        parts.append(f"### FILE: {a.path}\n{block}" if a.path else block)
+    return "\n\n".join(parts)
 
 
 class ProjectStore:
@@ -100,17 +115,31 @@ class ProjectStore:
                 return await s.scalar(sa.select(Project).where(Project.name == name))
             return p
 
-    async def create_project(self, name: str, description: str = "") -> dict:
+    async def create_project(self, name: str, description: str = "", repo: str | None = None,
+                             base_branch: str | None = None) -> dict:
         async with self.session() as s:
-            p = Project(name=name.strip(), description=description.strip())
+            p = Project(name=name.strip(), description=description.strip(), repo_full_name=repo or None,
+                        base_branch=base_branch or None)
             s.add(p)
             try:
                 await s.commit()
             except IntegrityError as exc:
                 await s.rollback()
                 raise ProjectExists(name) from exc
-            return {"id": p.id, "name": p.name, "description": p.description, "runs": 0,
-                    "last_run_at": None, "created_at": _iso(p.created_at)}
+            return project_dict(p)
+
+    async def update_project(self, project_id: int, **fields) -> dict | None:
+        """Update description / repo / base_branch (None clears the repo link)."""
+        allowed = {"description", "repo_full_name", "base_branch"}
+        async with self.session() as s:
+            p = await s.get(Project, project_id)
+            if not p:
+                return None
+            for k, v in fields.items():
+                if k in allowed:
+                    setattr(p, k, v)
+            await s.commit()
+            return project_dict(p)
 
     async def list_projects(self) -> list[dict]:
         q = (
@@ -121,11 +150,7 @@ class ProjectStore:
         )
         async with self.session() as s:
             rows = (await s.execute(q)).all()
-        return [
-            {"id": p.id, "name": p.name, "description": p.description, "runs": n,
-             "last_run_at": _iso(last), "created_at": _iso(p.created_at)}
-            for p, n, last in rows
-        ]
+        return [project_dict(p, n, last) for p, n, last in rows]
 
     async def get_project(self, project_id: int) -> Project | None:
         async with self.session() as s:
@@ -187,12 +212,27 @@ class ProjectStore:
             run.review = review
             run.review_verdict = str(review.get("verdict", ""))[:32] or None
             run.finished_at = utcnow()
-            for agent, code in (state.get("code") or {}).items():
-                s.add(ItArtifact(run_id=run_id, agent=agent, language=_language(code), content=code))
+            files = state.get("files")
+            if files:  # one row per file the coders wrote
+                for f in files:
+                    s.add(ItArtifact(run_id=run_id, agent=str(f.get("agent", ""))[:16], path=(f.get("path") or None),
+                                     language=str(f.get("language", "text"))[:16], content=str(f.get("content", ""))))
+            else:
+                for agent, code in (state.get("code") or {}).items():
+                    s.add(ItArtifact(run_id=run_id, agent=agent, language=_language(code), content=code))
             for f in review.get("findings") or []:
                 if isinstance(f, dict):
                     s.add(QaFinding(run_id=run_id, severity=str(f.get("severity", "low"))[:16].lower(),
                                     agent=str(f.get("agent", ""))[:16], issue=str(f.get("issue", ""))))
+            await s.commit()
+
+    async def set_pr(self, run_id: str, status: str, *, url: str | None = None, number: int | None = None,
+                     branch: str | None = None, error: str | None = None) -> None:
+        async with self.session() as s:
+            await s.execute(sa.update(ItRun).where(ItRun.id == run_id).values(
+                pr_status=status, pr_url=url, pr_number=number, pr_branch=branch,
+                pr_error=error[:4000] if error else None,
+            ))
             await s.commit()
 
     async def fail_run(self, run_id: str, error: str) -> None:
@@ -220,7 +260,10 @@ class ProjectStore:
             "assumptions": r.assumptions, "analysis": r.analysis, "review": r.review, "error": r.error,
             "tasks": [{"id": t.code, "title": t.title, "assignee": t.assignee, "depends_on": t.depends_on,
                        "done_when": t.done_when, "status": t.status} for t in r.tasks],
-            "code": {a.agent: a.content for a in r.artifacts},
+            "code": {agent: (_render_files(arts) if any(a.path for a in arts) else arts[0].content)
+                     for agent in dict.fromkeys(a.agent for a in r.artifacts)
+                     for arts in [[a for a in r.artifacts if a.agent == agent]]},
+            "files": [{"agent": a.agent, "path": a.path, "language": a.language} for a in r.artifacts],
             "findings": [{"severity": f.severity, "agent": f.agent, "issue": f.issue} for f in r.findings],
         }
 

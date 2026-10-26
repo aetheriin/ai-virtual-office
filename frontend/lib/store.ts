@@ -4,7 +4,8 @@ import { io, type Socket } from "socket.io-client";
 import { create } from "zustand";
 import { AGENTS, BACKEND_URL, type AgentId, type AgentState, type Dept } from "./agents";
 import type {
-  AgentMessage, AgentStates, Busy, Candle, ItResult, NewsSentiment, Project, RunDetail, RunSummary, Task, TradingPlan,
+  AgentMessage, AgentStates, Busy, Candle, ItResult, NewsSentiment, Project, PullRequestInfo, RunDetail, RunSummary, Task,
+  TradingPlan,
 } from "./types";
 
 export const BUBBLE_MS = 9000;
@@ -30,9 +31,13 @@ interface OfficeState {
   runs: RunSummary[];
   /** Sprint loaded from history (read-only view), null = live sprint */
   viewingRun: string | null;
+  /** Pull request of the live sprint (or of the sprint opened from history) */
+  pr: PullRequestInfo | null;
+  github: { configured: boolean; login?: string; error?: string } | null;
   loadProjects: () => Promise<void>;
   selectProject: (id: number) => Promise<void>;
-  createProject: (name: string, description: string) => Promise<boolean>;
+  createProject: (p: { name: string; description: string; repo?: string; base_branch?: string }) => Promise<boolean>;
+  updateProject: (id: number, patch: { repo?: string; base_branch?: string; description?: string }) => Promise<boolean>;
   openRun: (id: string) => Promise<void>;
   setFocus: (d: Dept | null) => void;
   analyze: (args: { symbol: string; interval: string; capital?: number; risk_pct?: number; account_currency: string }) => Promise<void>;
@@ -63,6 +68,8 @@ export const useOffice = create<OfficeState>((set, get) => ({
   projectId: null,
   runs: [],
   viewingRun: null,
+  pr: null,
+  github: null,
   setFocus: (focus) => set({ focus }),
 
   loadProjects: async () => {
@@ -80,17 +87,20 @@ export const useOffice = create<OfficeState>((set, get) => ({
     if (runs && get().projectId === id) set({ runs });
   },
 
-  createProject: async (name, description) => {
-    const res = await fetch(`${BACKEND_URL}/api/projects`, {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, description }),
-    }).catch(() => null);
-    if (!res?.ok) {
-      set({ error: res?.status === 409 ? "Nama proyek sudah dipakai" : "Gagal membuat proyek" });
-      return false;
-    }
-    const p: Project = await res.json();
+  createProject: async (body) => {
+    const res = await send("POST", "/api/projects", body);
+    if (!res) return false;
+    const p = res as Project;
     set({ projects: [p, ...get().projects] });
     await get().selectProject(p.id);
+    return true;
+  },
+
+  updateProject: async (id, patch) => {
+    const res = await send("PATCH", `/api/projects/${id}`, patch);
+    if (!res) return false;
+    const p = res as Project;
+    set({ projects: get().projects.map((x) => (x.id === id ? { ...x, ...p } : x)) });
     return true;
   },
 
@@ -99,6 +109,7 @@ export const useOffice = create<OfficeState>((set, get) => ({
     if (!run) return;
     set({
       viewingRun: id,
+      pr: run.pr,
       tasks: run.tasks,
       itResult: run.status === "running" ? null : {
         session_id: run.id, prompt: run.prompt,
@@ -118,7 +129,7 @@ export const useOffice = create<OfficeState>((set, get) => ({
   requestIt: async (prompt) => {
     const res = await emitAck("it:request", { prompt, project_id: get().projectId ?? undefined });
     if (!res.ok) set({ error: res.error ?? "Gagal mengirim permintaan" });
-    else set({ tasks: [], itResult: null, viewingRun: null, focus: "it" });
+    else set({ tasks: [], itResult: null, viewingRun: null, pr: null, focus: "it" });
   },
 }));
 
@@ -129,6 +140,25 @@ async function api<T>(path: string): Promise<T | null> {
     return (await res.json()) as T;
   } catch {
     useOffice.setState({ error: `Gagal memuat ${path}` });
+    return null;
+  }
+}
+
+/** JSON POST/PATCH; shows the backend's `detail` message on failure. */
+async function send(method: string, path: string, body: unknown): Promise<unknown | null> {
+  try {
+    const res = await fetch(`${BACKEND_URL}${path}`, {
+      method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const d = (data as { detail?: unknown }).detail;
+      useOffice.setState({ error: typeof d === "string" ? d : Array.isArray(d) ? "Input tidak valid" : `Gagal (${res.status})` });
+      return null;
+    }
+    return data;
+  } catch {
+    useOffice.setState({ error: "Backend tidak terhubung" });
     return null;
   }
 }
@@ -154,6 +184,7 @@ export function connectOffice() {
   socket.on("hello", (d: { llm_enabled: boolean; busy: Dept[]; project_db?: string }) => {
     set({ llmEnabled: d.llm_enabled, projectDb: d.project_db ?? null, busy: { it: d.busy.includes("it"), trade: d.busy.includes("trade") } });
     void get().loadProjects();
+    void api<OfficeState["github"]>("/api/github/status").then((g) => set({ github: g }));
   });
 
   socket.on("job:start", (d: { dept: Dept }) => set({ busy: { ...get().busy, [d.dept]: true } }));
@@ -180,6 +211,8 @@ export function connectOffice() {
     set({ tasks: get().tasks.map((t) => (t.assignee === d.assignee ? { ...t, status: d.status } : t)) }),
   );
   socket.on("it:result", (d: ItResult) => set({ itResult: d }));
+  socket.on("it:pr", (d: Partial<PullRequestInfo>) =>
+    set({ pr: { status: "none", url: null, number: null, branch: null, error: null, ...d } as PullRequestInfo }));
   socket.on("trade:market", (d: OfficeState["market"]) => set({ market: d }));
   socket.on("trade:news", (d: NewsSentiment) => set({ news: d }));
   socket.on("trade:plan", (d: TradingPlan) => set({ plan: d }));

@@ -33,6 +33,9 @@ class Project(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(sa.String(120), unique=True)
     description: Mapped[str] = mapped_column(sa.Text, default="")
+    # Connected GitHub repository ("owner/name"); sprints open pull requests against base_branch
+    repo_full_name: Mapped[str | None] = mapped_column(sa.String(200))
+    base_branch: Mapped[str | None] = mapped_column(sa.String(100))
     created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -45,6 +48,7 @@ class ItRun(Base):
     __tablename__ = "it_runs"
     __table_args__ = (
         sa.CheckConstraint("status IN ('running', 'done', 'failed')", name="status"),
+        sa.CheckConstraint("pr_status IN ('none', 'pending', 'opened', 'draft', 'skipped', 'failed')", name="pr_status"),
         sa.Index("ix_it_runs_project_created", "project_id", "created_at"),
     )
 
@@ -60,6 +64,11 @@ class ItRun(Base):
     error: Mapped[str | None] = mapped_column(sa.Text)
     created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    pr_status: Mapped[str] = mapped_column(sa.String(16), default="none", server_default="none")
+    pr_url: Mapped[str | None] = mapped_column(sa.Text)
+    pr_number: Mapped[int | None] = mapped_column(sa.Integer)
+    pr_branch: Mapped[str | None] = mapped_column(sa.String(200))
+    pr_error: Mapped[str | None] = mapped_column(sa.Text)
 
     project: Mapped[Project] = relationship(back_populates="runs")
     tasks: Mapped[list[ItTask]] = relationship(back_populates="run", cascade="all, delete-orphan",
@@ -98,6 +107,7 @@ class ItArtifact(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     run_id: Mapped[str] = mapped_column(sa.ForeignKey("it_runs.id", ondelete="CASCADE"), index=True)
     agent: Mapped[str] = mapped_column(sa.String(16))
+    path: Mapped[str | None] = mapped_column(sa.String(300))  # None = snippet without a target file
     language: Mapped[str] = mapped_column(sa.String(16), default="text")
     content: Mapped[str] = mapped_column(sa.Text)
     created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)

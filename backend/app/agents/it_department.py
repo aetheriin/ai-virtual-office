@@ -8,12 +8,22 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Awaitable, Callable
+from dataclasses import asdict
+from typing import Awaitable, Callable, Protocol
 
 from ..config import settings
+from ..github.files import parse_files
 from ..llm import chat, extract_json
 
 Emit = Callable[[str, dict], Awaitable[None]]
+
+
+class RepoAccess(Protocol):
+    """What the pipeline needs from a connected GitHub repo (see app.github.pr)."""
+
+    brief: str
+
+    async def read(self, paths: list[str]) -> dict[str, str]: ...
 
 SHARED_RULES = (
     "Aturan bersama: jangan berasumsi — pisahkan FAKTA dan ASUMSI secara eksplisit. Rahasia disimpan di .env, "
@@ -32,19 +42,26 @@ ROLES = {
 PM_SYSTEM = (
     f"Kamu adalah PROJECT MANAGER tim software. {SHARED_RULES} Pecah permintaan menjadi task kecil. "
     "Balas HANYA JSON: {\"summary\": str, \"assumptions\": [str], \"tasks\": [{\"id\": \"T1\", \"title\": str, "
-    "\"assignee\": \"analyst|db|be|fe|qa\", \"depends_on\": [str], \"done_when\": str}]}"
+    "\"assignee\": \"analyst|db|be|fe|qa\", \"depends_on\": [str], \"done_when\": str, "
+    "\"files\": [\"path/relatif yang akan dibuat/diubah\"]}]}. Jika ada REPO GITHUB, ikuti struktur & stack yang sudah ada."
 )
 ANALYST_SYSTEM = (
     f"Kamu adalah ANALIS KEBUTUHAN. {SHARED_RULES} Buat user story, acceptance criteria, edge cases, dan pertanyaan "
     "untuk user bila ada yang ambigu. Balas JSON: {\"user_stories\": [str], \"acceptance_criteria\": [str], "
     "\"edge_cases\": [str], \"open_questions\": [str]}"
 )
+FILE_FORMAT = (
+    "Tulis SETIAP file secara utuh dengan format persis:\n### FILE: path/relatif/dari/root-repo\n```bahasa\n<isi file>\n```\n"
+    "Jika REPO GITHUB diberikan, pakai struktur folder & stack yang sudah ada (jangan ganti framework). "
+    "Untuk file yang sudah ada, tulis ulang isinya LENGKAP termasuk bagian yang tidak berubah. "
+    "Jangan pernah menulis file .env, kunci, atau .github/workflows."
+)
 CODER_SYSTEM = {
-    "db": f"Kamu adalah DATABASE ENGINEER. {SHARED_RULES} Rancang skema relasional + migrasi SQL. Beri kode dalam satu blok ```sql.",
-    "be": (f"Kamu adalah BACKEND DEVELOPER. {SHARED_RULES} Tulis API (Python) yang aman: query terparameter (anti SQL injection), "
-           "hash password (bcrypt/argon2), validasi input, dokumentasi endpoint. Beri kode dalam satu blok kode."),
-    "fe": (f"Kamu adalah FRONTEND DEVELOPER. {SHARED_RULES} Tulis komponen Next.js + Tailwind yang responsif dengan validasi "
-           "sisi klien dan state loading/error. Beri kode dalam satu blok ```tsx."),
+    "db": f"Kamu adalah DATABASE ENGINEER. {SHARED_RULES} Rancang skema relasional + migrasi SQL. {FILE_FORMAT}",
+    "be": (f"Kamu adalah BACKEND DEVELOPER. {SHARED_RULES} Tulis API yang aman: query terparameter (anti SQL injection), "
+           f"hash password (bcrypt/argon2), validasi input, dokumentasi endpoint. Default Python bila stack belum ada. {FILE_FORMAT}"),
+    "fe": (f"Kamu adalah FRONTEND DEVELOPER. {SHARED_RULES} Tulis UI responsif dengan validasi sisi klien dan state "
+           f"loading/error. Default Next.js + Tailwind bila stack belum ada. {FILE_FORMAT}"),
 }
 QA_SYSTEM = (
     f"Kamu adalah QA & REVIEWER. Kamu TIDAK menulis fitur. {SHARED_RULES} Periksa apakah acceptance criteria terpenuhi, "
@@ -86,7 +103,8 @@ def fallback_analysis(prompt: str) -> dict:
 def fallback_code(role: str, prompt: str) -> str:
     name = _slug(prompt)
     if role == "db":
-        return f"""```sql
+        return f"""### FILE: migrations/001_create_{name}.sql
+```sql
 -- migration: 001_create_{name}.sql
 CREATE TABLE users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,7 +116,8 @@ CREATE TABLE users (
 CREATE INDEX idx_users_username ON users(username);
 ```"""
     if role == "be":
-        return """```python
+        return """### FILE: app/routes/auth.py
+```python
 from fastapi import APIRouter, Depends, HTTPException
 from passlib.hash import bcrypt
 from pydantic import BaseModel, Field
@@ -119,7 +138,8 @@ def login(body: LoginIn, db=Depends(get_db)):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     return {"token": issue_token(row["id"])}
 ```"""
-    return """```tsx
+    return """### FILE: components/LoginForm.tsx
+```tsx
 "use client";
 import { useState } from "react";
 
@@ -169,16 +189,28 @@ async def _say(emit: Emit, agent: str, kind: str, text: str, data=None) -> None:
     await emit("agent:message", {"agent": agent, "kind": kind, "text": text, "data": data})
 
 
-def _code_summary(role: str, code: str) -> str:
-    lines = [l for l in code.splitlines() if l.strip() and not l.startswith("```")]
+def _code_summary(role: str, code: str, files: list) -> str:
+    lines = [l for l in code.splitlines() if l.strip() and not l.startswith("```") and not l.startswith("### FILE")]
     what = {"db": "Skema & migrasi", "be": "API backend", "fe": "Komponen UI"}[role]
-    return f"{what} selesai ({len(lines)} baris)."
+    named = [f.path for f in files if f.path]
+    where = f" di {', '.join(named[:3])}{' ...' if len(named) > 3 else ''}" if named else ""
+    return f"{what} selesai ({len(lines)} baris{where})."
 
 
-async def run_it_pipeline(prompt: str, emit: Emit, project_context: str = "") -> dict:
-    """`project_context`: history of the project (earlier sprints, open QA findings) from PostgreSQL."""
+def _task_files(plan: dict, role: str) -> list[str]:
+    out: list[str] = []
+    for t in plan.get("tasks") or []:
+        if isinstance(t, dict) and str(t.get("assignee", "")).lower() == role:
+            out += [str(p) for p in t.get("files") or [] if isinstance(p, str)]
+    return out
+
+
+async def run_it_pipeline(prompt: str, emit: Emit, project_context: str = "", repo: RepoAccess | None = None) -> dict:
+    """`project_context`: history of the project (earlier sprints, open QA findings) from PostgreSQL.
+    `repo`: connected GitHub repository; its structure is shown to the agents and files they change are read first."""
     state: dict = {"prompt": prompt}
-    pm_input = f"{prompt}\n\nKONTEKS PROYEK:\n{project_context}" if project_context else prompt
+    extra = "\n\n".join(x for x in (project_context and f"KONTEKS PROYEK:\n{project_context}", repo and repo.brief) if x)
+    pm_input = f"{prompt}\n\n{extra}" if extra else prompt
 
     # PM
     await emit("agent:status", {"agent": "pm", "state": "standing"})
@@ -209,17 +241,25 @@ async def run_it_pipeline(prompt: str, emit: Emit, project_context: str = "") ->
 
     # Coders (sequential so each builds on the previous artifact)
     context = f"PERMINTAAN:\n{prompt}\n\nACCEPTANCE CRITERIA:\n{json.dumps(analysis, ensure_ascii=False)}"
+    if repo:
+        context += f"\n\n{repo.brief}"
     code: dict[str, str] = {}
+    files: list = []
     for role in ("db", "be", "fe"):
         await emit("agent:status", {"agent": role, "state": "typing"})
         await mark(role, "doing")
         prior = "\n\n".join(f"KODE {r.upper()}:\n{c}" for r, c in code.items())
-        out = await chat(settings.model_coder, CODER_SYSTEM[role], f"{context}\n\n{prior}", temperature=0.2)
+        existing = await repo.read(_task_files(plan, role)) if repo else {}
+        current = "\n\n".join(f"ISI FILE SAAT INI ({p}):\n```\n{t}\n```" for p, t in existing.items())
+        out = await chat(settings.model_coder, CODER_SYSTEM[role], f"{context}\n\n{current}\n\n{prior}", temperature=0.2)
         code[role] = out or fallback_code(role, prompt)
-        await _say(emit, role, "code", _code_summary(role, code[role]), {"code": code[role]})
+        role_files = parse_files(code[role], role)
+        files += role_files
+        await _say(emit, role, "code", _code_summary(role, code[role], role_files), {"code": code[role]})
         await mark(role, "done")
         await emit("agent:status", {"agent": role, "state": "idle"})
     state["code"] = code
+    state["files"] = [asdict(f) for f in files]
 
     # QA
     await emit("agent:status", {"agent": "qa", "state": "thinking"})

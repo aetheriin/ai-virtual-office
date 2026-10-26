@@ -59,6 +59,16 @@ class Settings:
     database_url: str = os.getenv("DATABASE_URL", "")
     db_auto_migrate: bool = _bool("DB_AUTO_MIGRATE", True)
 
+    # GitHub pull requests from the IT department (fine-grained token: Contents + Pull requests read/write)
+    github_token: str = os.getenv("GITHUB_TOKEN", "")
+    github_api_url: str = os.getenv("GITHUB_API_URL", "https://api.github.com")
+    auto_pr: bool = _bool("AUTO_PR", True)
+    # Without an LLM the coders emit generic templates; don't push those to real repos unless asked
+    allow_template_pr: bool = _bool("ALLOW_TEMPLATE_PR", False)
+    pr_branch_prefix: str = os.getenv("PR_BRANCH_PREFIX", "ai/")
+    pr_max_files: int = int(_float("PR_MAX_FILES", 40))
+    pr_max_file_kb: float = _float("PR_MAX_FILE_KB", 200)
+
     @property
     def llm_enabled(self) -> bool:
         return bool(self.openrouter_api_key or self.gemini_api_key)

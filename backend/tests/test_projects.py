@@ -54,7 +54,9 @@ async def test_migration_creates_schema_and_default_project(db):
         tables = await conn.run_sync(lambda c: set(sa.inspect(c).get_table_names()))
         version = (await conn.execute(sa.text("SELECT version_num FROM alembic_version"))).scalar()
     assert {"projects", "it_runs", "it_tasks", "it_artifacts", "qa_findings"} <= tables
-    assert version == "0001"
+    from alembic.script import ScriptDirectory
+    from app.projects.migrate import alembic_config
+    assert version == ScriptDirectory.from_config(alembic_config()).get_current_head()
     assert [p["name"] for p in await db.list_projects()] == [DEFAULT_PROJECT]
     await db.init()  # idempotent
 

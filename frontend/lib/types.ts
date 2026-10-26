@@ -110,9 +110,19 @@ export interface Project {
   id: number;
   name: string;
   description: string;
+  repo: string | null;
+  base_branch: string | null;
   runs: number;
   last_run_at: string | null;
   created_at: string;
+}
+
+export interface PullRequestInfo {
+  status: "none" | "pending" | "opened" | "draft" | "skipped" | "failed";
+  url: string | null;
+  number: number | null;
+  branch: string | null;
+  error: string | null;
 }
 
 export interface RunSummary {
@@ -124,6 +134,7 @@ export interface RunSummary {
   review_verdict: string | null;
   created_at: string;
   finished_at: string | null;
+  pr: PullRequestInfo;
 }
 
 export interface RunDetail extends RunSummary {

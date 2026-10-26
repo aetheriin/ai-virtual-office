@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { AGENT_BY_ID } from "@/lib/agents";
 import { useOffice } from "@/lib/store";
+import { PrCard } from "./PrCard";
 import { ProjectBar } from "./ProjectBar";
 
 const STATUS_COLOR = { todo: "#ff8a2a", doing: "#5fe6ff", done: "#4dff7c" } as const;
@@ -27,6 +28,8 @@ export function ItPanel() {
           {busy ? "Tim IT sedang bekerja..." : "Kirim ke PM"}
         </button>
       </form>
+
+      <PrCard />
 
       {tasks.length > 0 && (
         <div className="panel p-3">

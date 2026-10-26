@@ -8,8 +8,9 @@ import asyncio
 import logging
 import re
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
+import httpx
 import socketio
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +23,8 @@ from .db import Store
 from .market.data import INTERVALS, load_market, resolve
 from .market.indicators import candles_payload
 from .market.news import empty as empty_news, load_news
+from .github.client import GitHubClient, GitHubError
+from .github.pr import RepoContext, load_repo_context, open_sprint_pr, read_existing, valid_repo_name
 from .projects.store import DEFAULT_PROJECT, ProjectExists, ProjectStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -64,6 +67,33 @@ class ItRequest(BaseModel):
 class ProjectIn(BaseModel):
     name: str = Field(min_length=2, max_length=120, pattern=r"\S")
     description: str = Field(default="", max_length=4000)
+    repo: str | None = Field(default=None, max_length=200, description="GitHub repo owner/name")
+    base_branch: str | None = Field(default=None, max_length=100, pattern=r"^[\w./-]+$")
+
+
+class ProjectPatch(BaseModel):
+    description: str | None = Field(default=None, max_length=4000)
+    repo: str | None = Field(default=None, max_length=200, description="'' to disconnect")
+    base_branch: str | None = Field(default=None, max_length=100, pattern=r"^[\w./-]*$")
+
+
+async def _check_repo(repo: str) -> dict:
+    """Validate 'owner/name' and, when a token is configured, that it can push there."""
+    if not valid_repo_name(repo):
+        raise HTTPException(422, "Format repo harus owner/nama, mis. aetheriin/toko-online")
+    if not settings.github_token:
+        return {"checked": False, "warning": "GITHUB_TOKEN belum diatur; PR baru bisa dibuat setelah token diisi"}
+    async with GitHubClient() as gh:
+        try:
+            info = await gh.repo(repo)
+        except GitHubError as e:
+            if e.status in (401, 403, 404):
+                raise HTTPException(422, f"Token tidak bisa mengakses {repo} (GitHub {e.status}). "
+                                         "Tambahkan repo ini ke fine-grained token Anda.")
+            raise HTTPException(502, f"GitHub error: {e.message}")
+    if not info.can_push:
+        raise HTTPException(422, f"Token hanya punya akses baca ke {repo}; butuh izin Contents & Pull requests: write")
+    return {"checked": True, "default_branch": info.default_branch, "private": info.private}
 
 
 def _emitter(session_id: str):
@@ -115,6 +145,47 @@ async def _project_context(project_id: int) -> str:
     return "\n".join(lines)
 
 
+class _RepoAccess:
+    """Adapter handed to the IT pipeline: repo brief + reading files the agents plan to change."""
+
+    def __init__(self, gh: GitHubClient, ctx: RepoContext):
+        self.gh, self.ctx, self.brief = gh, ctx, ctx.brief
+
+    async def read(self, paths: list[str]) -> dict[str, str]:
+        try:
+            return await read_existing(self.gh, self.ctx, paths)
+        except GitHubError as e:
+            log.warning("reading repo files failed: %s", e)
+            return {}
+
+
+async def _open_pr(gh: GitHubClient, ctx: RepoContext, state: dict, session_id: str, project_name: str, emit) -> None:
+    if not settings.llm_enabled and not settings.allow_template_pr:
+        reason = "Rule engine aktif (tanpa LLM): kode template tidak dikirim ke repo. Set ALLOW_TEMPLATE_PR=true untuk uji coba."
+        await projects.set_pr(session_id, "skipped", error=reason)
+        await sio.emit("it:pr", {"session_id": session_id, "status": "skipped", "error": reason})
+        return
+    await emit("agent:status", {"agent": "pm", "state": "standing"})
+    await emit("agent:message", {"agent": "pm", "kind": "pr", "text": f"Membuka pull request ke {ctx.repo}..."})
+    try:
+        res = await open_sprint_pr(gh, ctx, state, session_id, project_name)
+    except (GitHubError, httpx.HTTPError) as e:
+        log.warning("PR failed: %s", e)
+        res = None
+        msg = e.message if isinstance(e, GitHubError) else f"koneksi ke GitHub gagal ({type(e).__name__})"
+        await projects.set_pr(session_id, "failed", error=msg)
+        await sio.emit("it:pr", {"session_id": session_id, "status": "failed", "error": msg})
+        await emit("agent:message", {"agent": "pm", "kind": "pr", "text": f"Gagal membuka PR: {msg}"})
+    if res:
+        await projects.set_pr(session_id, res.status, url=res.url, number=res.number, branch=res.branch, error=res.error)
+        await sio.emit("it:pr", {"session_id": session_id, "status": res.status, "url": res.url,
+                                 "number": res.number, "branch": res.branch, "error": res.error})
+        text = (f"PR #{res.number} dibuka{' (draft)' if res.status == 'draft' else ''}: {res.files} file. Silakan review di GitHub."
+                if res.url else f"PR tidak dibuat: {res.error}")
+        await emit("agent:message", {"agent": "pm", "kind": "pr", "text": text, "data": {"url": res.url}})
+    await emit("agent:status", {"agent": "pm", "state": "idle"})
+
+
 async def _it_job(req: ItRequest, session_id: str, project_id: int) -> dict:
     base_emit = _emitter(session_id)
 
@@ -128,10 +199,16 @@ async def _it_job(req: ItRequest, session_id: str, project_id: int) -> dict:
 
     await sio.emit("job:start", {"session_id": session_id, "dept": "it", "input": req.prompt, "project_id": project_id})
     try:
-        state = await run_it_pipeline(req.prompt, emit, await _project_context(project_id))
-        await projects.finish_run(session_id, state)
-        await sio.emit("it:result", {"session_id": session_id, "project_id": project_id, **state})
-        return state
+        async with AsyncExitStack() as stack:
+            project = await projects.get_project(project_id)
+            gh, ctx = await _connect_repo(stack, project, session_id, emit)
+            repo = _RepoAccess(gh, ctx) if gh and ctx else None
+            state = await run_it_pipeline(req.prompt, emit, await _project_context(project_id), repo)
+            await projects.finish_run(session_id, state)
+            await sio.emit("it:result", {"session_id": session_id, "project_id": project_id, **state})
+            if gh and ctx:
+                await _open_pr(gh, ctx, state, session_id, project.name, emit)
+            return state
     except Exception as exc:
         log.exception("it job failed")
         await projects.fail_run(session_id, str(exc))
@@ -140,6 +217,27 @@ async def _it_job(req: ItRequest, session_id: str, project_id: int) -> dict:
     finally:
         _running.discard("it")
         await sio.emit("job:end", {"session_id": session_id, "dept": "it"})
+
+
+async def _connect_repo(stack: AsyncExitStack, project, session_id: str, emit) -> tuple[GitHubClient | None, RepoContext | None]:
+    """Open a GitHub client and read the project's repo; on any problem the sprint continues without a PR."""
+    if not (project and project.repo_full_name and settings.auto_pr):
+        return None, None
+    if not settings.github_token:
+        await projects.set_pr(session_id, "skipped", error="GITHUB_TOKEN belum diatur")
+        return None, None
+    gh = await stack.enter_async_context(GitHubClient())
+    try:
+        ctx = await load_repo_context(gh, project.repo_full_name, project.base_branch)
+        await projects.set_pr(session_id, "pending")  # a PR will follow this sprint
+        await sio.emit("it:pr", {"session_id": session_id, "status": "pending", "repo": ctx.repo, "empty": ctx.empty})
+        return gh, ctx
+    except (GitHubError, httpx.HTTPError) as e:
+        msg = e.message if isinstance(e, GitHubError) else f"koneksi ke GitHub gagal ({type(e).__name__})"
+        await projects.set_pr(session_id, "failed", error=f"Tidak bisa membaca repo: {msg}")
+        await emit("agent:message", {"agent": "pm", "kind": "pr",
+                                     "text": f"Repo {project.repo_full_name} tidak bisa dibaca ({msg}); sprint lanjut tanpa PR."})
+        return None, None
 
 
 def _claim(dept: str) -> str:
@@ -196,10 +294,43 @@ async def list_projects():
 
 @app.post("/api/projects", status_code=201)
 async def create_project(body: ProjectIn):
+    repo = (body.repo or "").strip() or None
+    check = await _check_repo(repo) if repo else None
     try:
-        return await projects.create_project(body.name, body.description)
+        p = await projects.create_project(body.name, body.description, repo, body.base_branch or None)
     except ProjectExists:
         raise HTTPException(409, "Nama proyek sudah dipakai")
+    return {**p, "github": check}
+
+
+@app.patch("/api/projects/{project_id}")
+async def update_project(project_id: int, body: ProjectPatch):
+    fields: dict = {}
+    check = None
+    if body.description is not None:
+        fields["description"] = body.description.strip()
+    if body.repo is not None:
+        repo = body.repo.strip()
+        if repo:
+            check = await _check_repo(repo)
+        fields["repo_full_name"] = repo or None
+    if body.base_branch is not None:
+        fields["base_branch"] = body.base_branch.strip() or None
+    p = await projects.update_project(project_id, **fields)
+    if not p:
+        raise HTTPException(404, "Proyek tidak ditemukan")
+    return {**p, "github": check}
+
+
+@app.get("/api/github/status")
+async def github_status():
+    if not settings.github_token:
+        return {"configured": False}
+    async with GitHubClient() as gh:
+        try:
+            return {"configured": True, "login": (await gh.user()).get("login")}
+        except GitHubError as e:
+            return {"configured": True, "error": f"Token ditolak GitHub ({e.status})"}
 
 
 @app.delete("/api/projects/{project_id}", status_code=204)

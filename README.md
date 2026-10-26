@@ -64,7 +64,7 @@ npm run dev                         # http://localhost:3000
 ### 4. Tes
 
 ```bash
-cd backend && pytest -q             # 53 tes: risk math, debat, sentimen berita, pipeline IT, database (offline)
+cd backend && pytest -q             # 91 tes: risk math, debat, sentimen berita, pipeline IT, database, PR GitHub (offline, GitHub palsu)
 # tes database juga terhadap PostgreSQL sungguhan (skema di DB ini akan di-reset):
 TEST_DATABASE_URL=postgresql://office:office@localhost:5432/office_test pytest -q tests/test_projects.py
 cd frontend && npm test && npm run typecheck && npm run build   # npm test: logika avatar .glb (Node 22+)
@@ -78,10 +78,10 @@ Sesuai master plan, data dipisah dua:
 
 | Tabel | Isi |
 |---|---|
-| `projects` | proyek (nama unik, deskripsi) |
-| `it_runs` | satu sprint per brief: prompt, status `running/done/failed`, ringkasan PM, asumsi, analisis, dan review QA (JSONB) |
+| `projects` | proyek (nama unik, deskripsi, repo GitHub + branch dasar) |
+| `it_runs` | satu sprint per brief: prompt, status `running/done/failed`, ringkasan PM, asumsi, analisis, review QA (JSONB), dan status/URL pull request |
 | `it_tasks` | papan tugas per sprint: kode T1…, assignee, dependensi, kriteria selesai, status `todo/doing/done` |
-| `it_artifacts` | kode dari agen DB/BE/FE beserta bahasanya (`sql`, `python`, `tsx`, …) |
+| `it_artifacts` | file kode dari agen DB/BE/FE: path, bahasa (`sql`, `python`, `tsx`, …), isi |
 | `qa_findings` | temuan QA per tingkat (`high/medium/low`) |
 
 - **Tersimpan otomatis.** Status papan tugas disimpan saat agen bekerja. Sprint yang gagal tetap tercatat beserta errornya.
@@ -94,6 +94,38 @@ alembic upgrade head                               # terapkan migrasi
 alembic revision --autogenerate -m "tambah kolom"  # buat migrasi baru setelah mengubah app/projects/models.py
 alembic check                                      # pastikan model == migrasi
 ```
+
+## Pull request otomatis (Departemen IT → GitHub)
+
+Hubungkan proyek ke repo GitHub, dan setiap sprint selesai dengan **pull request** berisi kode dari agen DB/BE/FE. Anda tinggal review di GitHub lalu merge.
+
+**1. Buat token GitHub** di GitHub → Settings → Developer settings → *Fine-grained tokens*, lalu isi sebagai `GITHUB_TOKEN` di `.env`.
+
+| Pengaturan token | Isi |
+|---|---|
+| Repository access | **Only select repositories**: pilih repo yang akan dihubungkan |
+| Contents | Read and write |
+| Pull requests | Read and write |
+| Metadata | Read (otomatis) |
+| Issues | Read and write (opsional, untuk label `ai-agent`) |
+
+**2. Hubungkan proyek.** Di panel Dept. IT, isi *Repo GitHub* (`owner/nama`) saat membuat proyek, atau klik **HUBUNGKAN** pada proyek yang sudah ada. Backend langsung mengecek apakah token bisa menulis ke repo itu.
+
+**3. Kirim brief.** Alurnya:
+1. PM dan agen membaca struktur repo dan file kunci (README, `package.json`, `requirements.txt`, …).
+2. Coder menulis kode per file (`### FILE: path`), dan file yang akan diubah dibaca dulu isinya.
+3. Setelah QA, sistem membuat branch `ai/<brief>-<id>`, satu commit, dan PR. Deskripsi PR berisi brief, rencana PM, asumsi, acceptance criteria, daftar file, dan hasil review QA.
+
+**Web baru = repo kosong baru.** Buat repo kosong di GitHub (tanpa README), tambahkan ke token, lalu hubungkan ke proyek baru. Karena GitHub tidak bisa membuat branch di repo tanpa commit, sistem membuat satu commit `README.md` di branch utama. Setelah itu kerangka proyeknya tetap masuk lewat PR.
+
+**Pengaman (ditegakkan oleh kode, bukan diserahkan ke model):**
+- **Tidak pernah push ke branch utama.** Satu-satunya pengecualian adalah README awal untuk repo kosong. Merge selalu manual oleh Anda.
+- **Draft bila QA belum lolos.** PR dibuka sebagai **draft** kalau QA tidak `PASS` atau ada temuan *high*. Di repo privat akun gratis, GitHub tidak mendukung draft, jadi PR dibuka biasa dengan judul `[WIP]`.
+- **File berbahaya ditolak.** File `.env`/kunci privat, folder `.git`, workflow `.github/workflows/`, path `..`/absolut, dan file > `PR_MAX_FILE_KB` tidak disertakan. Daftarnya ditulis di deskripsi PR.
+- **Template tidak dikirim.** Tanpa LLM (mode *rule engine*), kodenya hanya template generik, jadi PR **tidak** dibuat kecuali `ALLOW_TEMPLATE_PR=true` (untuk uji coba di repo percobaan).
+- **Gangguan GitHub tidak menggagalkan sprint.** Kalau repo tidak bisa dibaca atau GitHub bermasalah, sprint tetap selesai dan alasannya tercatat (`pr.status = failed`).
+
+Status PR (`pending/opened/draft/skipped/failed`, URL, nomor, branch) tersimpan di tabel `it_runs` dan tampil di panel serta riwayat sprint.
 
 ## Sentimen berita
 
@@ -144,12 +176,14 @@ Semua model bisa diganti lewat `.env`. ID model gratis di OpenRouter sering beru
 | GET | `/api/sessions`, `/api/sessions/{id}` | riwayat & log debat (SQLite) |
 | GET | `/api/plans?symbol=BBCA` | riwayat trading plan |
 | GET | `/api/news/{symbol}` | sentimen berita saja (tanpa debat) |
-| GET / POST | `/api/projects` | daftar / buat proyek `{name, description}` |
+| GET / POST | `/api/projects` | daftar / buat proyek `{name, description, repo?, base_branch?}` |
 | DELETE | `/api/projects/{id}` | hapus proyek beserta semua sprint-nya |
+| PATCH | `/api/projects/{id}` | `{repo, base_branch, description}`; `repo: ""` melepas repo |
+| GET | `/api/github/status` | apakah `GITHUB_TOKEN` diatur dan valid |
 | GET | `/api/projects/{id}/runs` | riwayat sprint proyek |
 | GET | `/api/it/runs/{id}` | detail sprint: task, kode, temuan QA |
 
-Event Socket.IO: `agent:status`, `agent:message`, `it:tasks`, `it:task_status`, `it:result`, `trade:market`, `trade:news`, `trade:plan`, `job:start|end|error`.
+Event Socket.IO: `agent:status`, `agent:message`, `it:tasks`, `it:task_status`, `it:result`, `it:pr`, `trade:market`, `trade:news`, `trade:plan`, `job:start|end|error`.
 
 ## Avatar 3D (.glb)
 
@@ -194,6 +228,6 @@ Cara kerjanya:
 
 - Suara (TTS) + lip-sync Rhubarb berbasis audio; retarget rig VRM/VRoid.
 - Akun pengguna & login (tabel `users` di PostgreSQL).
-- Agen IT menulis langsung ke repo (PR otomatis).
+- Agen memperbaiki PR sendiri dari komentar review & hasil CI GitHub.
 
 > ⚠️ Bukan saran keuangan. Trading Plan adalah alat bantu analisa; selalu verifikasi sendiri sebelum eksekusi di MetaTrader/sekuritas.
