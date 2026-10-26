@@ -175,12 +175,14 @@ def _code_summary(role: str, code: str) -> str:
     return f"{what} selesai ({len(lines)} baris)."
 
 
-async def run_it_pipeline(prompt: str, emit: Emit) -> dict:
+async def run_it_pipeline(prompt: str, emit: Emit, project_context: str = "") -> dict:
+    """`project_context`: history of the project (earlier sprints, open QA findings) from PostgreSQL."""
     state: dict = {"prompt": prompt}
+    pm_input = f"{prompt}\n\nKONTEKS PROYEK:\n{project_context}" if project_context else prompt
 
     # PM
     await emit("agent:status", {"agent": "pm", "state": "standing"})
-    plan = extract_json(await chat(settings.model_pm, PM_SYSTEM, prompt, prefer_gemini=True, temperature=0.2))
+    plan = extract_json(await chat(settings.model_pm, PM_SYSTEM, pm_input, prefer_gemini=True, temperature=0.2))
     if not (isinstance(plan, dict) and isinstance(plan.get("tasks"), list) and plan["tasks"]):
         plan = fallback_plan(prompt)
     state["plan"] = plan

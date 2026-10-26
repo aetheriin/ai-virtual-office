@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { AGENT_BY_ID } from "@/lib/agents";
 import { useOffice } from "@/lib/store";
+import { ProjectBar } from "./ProjectBar";
 
 const STATUS_COLOR = { todo: "#ff8a2a", doing: "#5fe6ff", done: "#4dff7c" } as const;
 const SEVERITY_COLOR: Record<string, string> = { high: "#ff4d5e", medium: "#ff8a2a", low: "#5fe6ff" };
@@ -17,6 +18,7 @@ export function ItPanel() {
 
   return (
     <div className="space-y-3">
+      <ProjectBar />
       <form onSubmit={(e) => { e.preventDefault(); if (prompt.trim().length >= 3) void requestIt(prompt.trim()); }} className="space-y-2">
         <label className="font-pixel text-[8px] text-white/60" htmlFor="it-prompt">BRIEF UNTUK PROJECT MANAGER</label>
         <textarea id="it-prompt" className="field min-h-[84px] resize-y" maxLength={4000} value={prompt} onChange={(e) => setPrompt(e.target.value)} />

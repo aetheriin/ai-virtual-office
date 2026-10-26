@@ -54,6 +54,10 @@ class Settings:
         default_factory=lambda: [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
     )
     sqlite_path: str = os.getenv("SQLITE_PATH", str(ROOT / "backend" / "office.db"))
+    # PostgreSQL for IT project data, e.g. postgresql://office:office@localhost:5432/office
+    # Empty -> local SQLite file (backend/projects.db) so the app still runs without a DB server.
+    database_url: str = os.getenv("DATABASE_URL", "")
+    db_auto_migrate: bool = _bool("DB_AUTO_MIGRATE", True)
 
     @property
     def llm_enabled(self) -> bool:

@@ -8,3 +8,7 @@ numpy>=1.26
 yfinance>=0.2.50
 pytest>=8.0
 pytest-asyncio>=0.23
+sqlalchemy[asyncio]>=2.0.30
+asyncpg>=0.29
+aiosqlite>=0.20
+alembic>=1.13

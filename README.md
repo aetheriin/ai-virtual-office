@@ -19,6 +19,7 @@ Next.js + Tailwind + React Three Fiber  ◀── Socket.IO ──▶  FastAPI +
                                                               ├─ market/news.py           (sentimen berita: Alpha Vantage, Finnhub, RSS, yfinance)
                                                               ├─ risk.py                  (RR, ukuran posisi, tick IDX)
                                                               ├─ llm.py                   (OpenRouter + Google AI Studio)
+                                                              ├─ projects/                (PostgreSQL: proyek, sprint, task, kode, temuan QA)
                                                               └─ db.py                    (SQLite: log debat & plan)
 ```
 
@@ -31,10 +32,18 @@ Next.js + Tailwind + React Three Fiber  ◀── Socket.IO ──▶  FastAPI +
 
 ## Menjalankan
 
-### 1. Backend (Python 3.11+)
+### 1. Database PostgreSQL
 
 ```bash
 cp .env.example .env            # isi OPENROUTER_API_KEY / GEMINI_API_KEY bila ada
+docker compose up -d            # PostgreSQL 16 di localhost:5432 (user/pass/db: office)
+```
+
+Tanpa Docker: pakai PostgreSQL yang sudah ada dan isi `DATABASE_URL`. Kalau `DATABASE_URL` dikosongkan, backend otomatis memakai file SQLite `backend/projects.db`, jadi aplikasi tetap jalan tanpa server database.
+
+### 2. Backend (Python 3.11+)
+
+```bash
 cd backend
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -43,7 +52,7 @@ uvicorn app.main:asgi --reload --port 8000
 
 Opsional untuk forex real-time di Windows: `pip install MetaTrader5` dan buka terminal MT5. Sumber data lalu dipakai otomatis sesuai urutan MT5 → yfinance → Twelve Data.
 
-### 2. Frontend (Node 20+)
+### 3. Frontend (Node 20+)
 
 ```bash
 cd frontend
@@ -52,11 +61,38 @@ npm install
 npm run dev                         # http://localhost:3000
 ```
 
-### 3. Tes
+### 4. Tes
 
 ```bash
-cd backend && pytest -q             # 42 tes: risk math, debat, sentimen berita, pipeline IT (offline)
+cd backend && pytest -q             # 53 tes: risk math, debat, sentimen berita, pipeline IT, database (offline)
+# tes database juga terhadap PostgreSQL sungguhan (skema di DB ini akan di-reset):
+TEST_DATABASE_URL=postgresql://office:office@localhost:5432/office_test pytest -q tests/test_projects.py
 cd frontend && npm run typecheck && npm run build
+```
+
+## Database proyek IT (PostgreSQL)
+
+Sesuai master plan, data dipisah dua:
+- **SQLite** menyimpan log debat dan memori agen.
+- **PostgreSQL** menyimpan data proyek IT, yaitu tabel berikut.
+
+| Tabel | Isi |
+|---|---|
+| `projects` | proyek (nama unik, deskripsi) |
+| `it_runs` | satu sprint per brief: prompt, status `running/done/failed`, ringkasan PM, asumsi, analisis, dan review QA (JSONB) |
+| `it_tasks` | papan tugas per sprint: kode T1…, assignee, dependensi, kriteria selesai, status `todo/doing/done` |
+| `it_artifacts` | kode dari agen DB/BE/FE beserta bahasanya (`sql`, `python`, `tsx`, …) |
+| `qa_findings` | temuan QA per tingkat (`high/medium/low`) |
+
+- **Tersimpan otomatis.** Status papan tugas disimpan saat agen bekerja. Sprint yang gagal tetap tercatat beserta errornya.
+- **Memori proyek.** Saat brief baru masuk, PM menerima konteks 5 sprint terakhir dan temuan QA *high* di proyek itu, jadi sprint berikutnya melanjutkan pekerjaan yang ada.
+- **Di UI.** Panel Dept. IT punya pemilih proyek, tombol **+ Baru**, dan **Riwayat Sprint** untuk membuka ulang hasil sprint lama.
+- **Migrasi.** Alembic menjalankannya otomatis saat startup (`DB_AUTO_MIGRATE=true`). Lewat CLI, dari folder `backend/`:
+
+```bash
+alembic upgrade head                               # terapkan migrasi
+alembic revision --autogenerate -m "tambah kolom"  # buat migrasi baru setelah mengubah app/projects/models.py
+alembic check                                      # pastikan model == migrasi
 ```
 
 ## Sentimen berita
@@ -104,10 +140,14 @@ Semua model bisa diganti lewat `.env`. ID model gratis di OpenRouter sering beru
 |---|---|---|
 | GET | `/api/health` | status, LLM aktif, departemen sibuk |
 | POST | `/api/trade/analyze` | `{symbol, interval, capital, risk_pct, today_loss_pct, account_currency}` |
-| POST | `/api/it/request` | `{prompt}` |
+| POST | `/api/it/request` | `{prompt, project_id?}`; tanpa `project_id` masuk ke proyek "Umum" |
 | GET | `/api/sessions`, `/api/sessions/{id}` | riwayat & log debat (SQLite) |
 | GET | `/api/plans?symbol=BBCA` | riwayat trading plan |
 | GET | `/api/news/{symbol}` | sentimen berita saja (tanpa debat) |
+| GET / POST | `/api/projects` | daftar / buat proyek `{name, description}` |
+| DELETE | `/api/projects/{id}` | hapus proyek beserta semua sprint-nya |
+| GET | `/api/projects/{id}/runs` | riwayat sprint proyek |
+| GET | `/api/it/runs/{id}` | detail sprint: task, kode, temuan QA |
 
 Event Socket.IO: `agent:status`, `agent:message`, `it:tasks`, `it:task_status`, `it:result`, `trade:market`, `trade:news`, `trade:plan`, `job:start|end|error`.
 
@@ -118,6 +158,7 @@ Avatar default berupa voxel prosedural (banteng, beruang, orb hakim, dan staf IT
 ## Roadmap
 
 - Lip sync (Rhubarb) dan klip Mixamo untuk avatar `.glb`.
-- PostgreSQL untuk data pengguna/proyek IT; agen IT menulis langsung ke repo (PR otomatis).
+- Akun pengguna & login (tabel `users` di PostgreSQL).
+- Agen IT menulis langsung ke repo (PR otomatis).
 
 > ⚠️ Bukan saran keuangan. Trading Plan adalah alat bantu analisa; selalu verifikasi sendiri sebelum eksekusi di MetaTrader/sekuritas.

@@ -105,3 +105,33 @@ export interface ItResult {
 
 export type AgentStates = Record<AgentId, AgentState>;
 export type Busy = Record<Dept, boolean>;
+
+export interface Project {
+  id: number;
+  name: string;
+  description: string;
+  runs: number;
+  last_run_at: string | null;
+  created_at: string;
+}
+
+export interface RunSummary {
+  id: string;
+  project_id: number;
+  prompt: string;
+  status: "running" | "done" | "failed";
+  summary: string;
+  review_verdict: string | null;
+  created_at: string;
+  finished_at: string | null;
+}
+
+export interface RunDetail extends RunSummary {
+  assumptions: string[];
+  analysis: ItResult["analysis"];
+  review: ItResult["review"];
+  error: string | null;
+  tasks: Task[];
+  code: ItResult["code"];
+  findings: { severity: string; agent: string; issue: string }[];
+}

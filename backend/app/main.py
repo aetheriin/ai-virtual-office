@@ -8,6 +8,7 @@ import asyncio
 import logging
 import re
 import uuid
+from contextlib import asynccontextmanager
 
 import socketio
 from fastapi import FastAPI, HTTPException
@@ -21,13 +22,25 @@ from .db import Store
 from .market.data import INTERVALS, load_market, resolve
 from .market.indicators import candles_payload
 from .market.news import empty as empty_news, load_news
+from .projects.store import DEFAULT_PROJECT, ProjectExists, ProjectStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("office")
 
 store = Store()
+projects = ProjectStore()
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins=settings.cors_origins)
-app = FastAPI(title="AI Virtual Office & Trading Hub", version="0.1.0")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await projects.init(migrate=settings.db_auto_migrate)
+    log.info("project database: %s", projects.backend)
+    yield
+    await projects.close()
+
+
+app = FastAPI(title="AI Virtual Office & Trading Hub", version="0.2.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_methods=["*"], allow_headers=["*"])
 
 AGENTS = {**ROLES, "bull": "Bull Agent", "bear": "Bear Agent", "risk": "Risk Agent"}
@@ -45,6 +58,12 @@ class TradeRequest(BaseModel):
 
 class ItRequest(BaseModel):
     prompt: str = Field(min_length=3, max_length=4000)
+    project_id: int | None = Field(default=None, gt=0)
+
+
+class ProjectIn(BaseModel):
+    name: str = Field(min_length=2, max_length=120, pattern=r"\S")
+    description: str = Field(default="", max_length=4000)
 
 
 def _emitter(session_id: str):
@@ -87,15 +106,35 @@ async def _trade_job(req: TradeRequest, session_id: str) -> dict:
         await sio.emit("job:end", {"session_id": session_id, "dept": "trade"})
 
 
-async def _it_job(req: ItRequest, session_id: str) -> dict:
-    emit = _emitter(session_id)
-    await sio.emit("job:start", {"session_id": session_id, "dept": "it", "input": req.prompt})
+async def _project_context(project_id: int) -> str:
+    """Earlier sprints + open high QA findings, so the PM plans on top of what already exists."""
+    runs = [r for r in await projects.list_runs(project_id, limit=5) if r["status"] == "done"]
+    findings = await projects.open_findings(project_id)
+    lines = [f"- Sprint sebelumnya: {r['prompt'][:160]} (QA: {r['review_verdict'] or '-'})" for r in runs]
+    lines += [f"- Temuan QA HIGH belum ditutup ({f['agent']}): {f['issue'][:200]}" for f in findings[:5]]
+    return "\n".join(lines)
+
+
+async def _it_job(req: ItRequest, session_id: str, project_id: int) -> dict:
+    base_emit = _emitter(session_id)
+
+    async def emit(event: str, data: dict) -> None:
+        # Persist task board changes to PostgreSQL while streaming them to the office
+        if event == "it:tasks":
+            await projects.set_tasks(session_id, data["tasks"])
+        elif event == "it:task_status":
+            await projects.set_task_status(session_id, data["assignee"], data["status"])
+        await base_emit(event, data)
+
+    await sio.emit("job:start", {"session_id": session_id, "dept": "it", "input": req.prompt, "project_id": project_id})
     try:
-        state = await run_it_pipeline(req.prompt, emit)
-        await sio.emit("it:result", {"session_id": session_id, **state})
+        state = await run_it_pipeline(req.prompt, emit, await _project_context(project_id))
+        await projects.finish_run(session_id, state)
+        await sio.emit("it:result", {"session_id": session_id, "project_id": project_id, **state})
         return state
     except Exception as exc:
         log.exception("it job failed")
+        await projects.fail_run(session_id, str(exc))
         await sio.emit("job:error", {"session_id": session_id, "dept": "it", "error": str(exc)})
         raise
     finally:
@@ -113,7 +152,7 @@ def _claim(dept: str) -> str:
 # --------------------------------------------------------------------------- REST
 @app.get("/api/health")
 def health():
-    return {"ok": True, "llm_enabled": settings.llm_enabled, "busy": sorted(_running)}
+    return {"ok": True, "llm_enabled": settings.llm_enabled, "busy": sorted(_running), "project_db": projects.backend}
 
 
 @app.get("/api/agents")
@@ -133,10 +172,57 @@ async def trade_analyze(req: TradeRequest):
 
 @app.post("/api/it/request", status_code=202)
 async def it_request(req: ItRequest):
+    if req.project_id is not None:
+        if not await projects.get_project(req.project_id):
+            raise HTTPException(404, "Proyek tidak ditemukan")
+        project_id = req.project_id
+    else:
+        project_id = (await projects.ensure_project(DEFAULT_PROJECT)).id
     sid = _claim("it")
-    store.create_session(sid, "it", req.prompt)
-    asyncio.create_task(_it_job(req, sid))
-    return {"session_id": sid}
+    try:
+        await projects.create_run(sid, project_id, req.prompt)
+        store.create_session(sid, "it", req.prompt)
+    except Exception:
+        _running.discard("it")
+        raise
+    asyncio.create_task(_it_job(req, sid, project_id))
+    return {"session_id": sid, "project_id": project_id}
+
+
+@app.get("/api/projects")
+async def list_projects():
+    return await projects.list_projects()
+
+
+@app.post("/api/projects", status_code=201)
+async def create_project(body: ProjectIn):
+    try:
+        return await projects.create_project(body.name, body.description)
+    except ProjectExists:
+        raise HTTPException(409, "Nama proyek sudah dipakai")
+
+
+@app.delete("/api/projects/{project_id}", status_code=204)
+async def delete_project(project_id: int):
+    if "it" in _running:
+        raise HTTPException(409, "Tim IT masih bekerja, tunggu selesai")
+    if not await projects.delete_project(project_id):
+        raise HTTPException(404, "Proyek tidak ditemukan")
+
+
+@app.get("/api/projects/{project_id}/runs")
+async def project_runs(project_id: int, limit: int = 20):
+    if not await projects.get_project(project_id):
+        raise HTTPException(404, "Proyek tidak ditemukan")
+    return await projects.list_runs(project_id, min(limit, 100))
+
+
+@app.get("/api/it/runs/{run_id}")
+async def it_run(run_id: str):
+    run = await projects.get_run(run_id)
+    if not run:
+        raise HTTPException(404, "Sprint tidak ditemukan")
+    return run
 
 
 @app.get("/api/news/{symbol}")
@@ -164,7 +250,8 @@ def plans(symbol: str | None = None):
 # --------------------------------------------------------------------------- Socket.IO
 @sio.event
 async def connect(sid, environ):
-    await sio.emit("hello", {"agents": agents(), "llm_enabled": settings.llm_enabled, "busy": sorted(_running)}, to=sid)
+    await sio.emit("hello", {"agents": agents(), "llm_enabled": settings.llm_enabled, "busy": sorted(_running),
+                             "project_db": projects.backend}, to=sid)
 
 
 @sio.on("trade:analyze")
