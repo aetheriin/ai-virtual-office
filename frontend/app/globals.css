@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+  background: #070c18;
+  color: #d8e3ff;
+  overflow: hidden;
+}
+
+/* Pixel-art speech bubble (matches the reference art) */
+.bubble {
+  position: relative;
+  background: #fff;
+  color: #0b0f18;
+  padding: 6px 8px;
+  border: 2px solid #0b0f18;
+  box-shadow: 3px 3px 0 #0b0f18;
+  border-radius: 4px;
+}
+.bubble::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -8px;
+  transform: translateX(-50%);
+  border: 6px solid transparent;
+  border-top-color: #0b0f18;
+}
+
+.panel {
+  @apply rounded-md border border-neon-green/30 bg-night-900/90 backdrop-blur-sm;
+  box-shadow: 0 0 0 1px rgba(77, 255, 124, 0.08), 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+
+.scanlines {
+  background-image: repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.025) 0 1px, transparent 1px 3px);
+}
+
+.field {
+  @apply w-full rounded-sm border border-night-600 bg-night-950 px-2 py-1.5 font-term text-lg text-white outline-none focus:border-neon-green;
+}
+
+.btn {
+  @apply rounded-sm border px-3 py-1.5 font-pixel text-[10px] uppercase transition disabled:cursor-not-allowed disabled:opacity-40;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-thumb {
+  background: #22324f;
+}
